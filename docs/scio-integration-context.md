@@ -61,31 +61,28 @@ Chọn preset **`scio_portal_mvp`** (tab Billing policy, hoặc
 
 ### Danh mục trong phạm vi
 
-| Mã | Tên | Tháng | Năm | Hạn mức |
+| Mã | Tên | Tháng | Năm | Ghi chú |
 |---|---|---|---|---|
-| `standard` | Standard plan | $10.00 | $9.00/th | **1 màn hình** |
-| `x_social_standard` | X Social Standard | $10.00 | $9.00/th | 600 post/tháng |
-| `x_social_pro` | X Social Pro | $30.00 | $27.00/th | 2.000 post/tháng |
+| `standard` | Standard plan | $10.00 | $108/năm | theo màn hình |
+| `x_social` | X Social | **$20.00** | **$216/năm** | quantity cố định 1, 2.000 Post Updates / quota month |
 
-### Luật
+### Luật (MODEL V6)
 
-| Thao tác | Timing | Cách tính tiền | Tiền đi đâu |
-|---|---|---|---|
-| Mua X lần đầu | ngay | **đủ giá, đủ hạn mức** — không prorate theo ngày | trừ thẻ |
-| Nâng tier X | ngay | trả lại post chưa tiêu, tính đủ giá tier mới | trừ thẻ phần chênh |
-| **Hạ tier X** | ngay | `giá × post chưa tiêu / hạn mức` (+ tháng trọn chưa đụng) | **Stripe credit** |
-| **Bỏ X** | cuối kỳ | không tính gì | **không hoàn** |
-| Huỷ plan | cuối kỳ | không prorate | **không hoàn** |
-| Đổi term | ngay | plan theo **thời gian**, X theo **post** | credit hoặc trừ thẻ |
+| Thao tác | Tiền (Stripe) | Quota (SCIO) |
+|---|---|---|
+| Mua X | prorate tới billing boundary, thu ngay, thẻ hỏng thì không đổi gì | reservation 2.000 trước; paid → grant `floor(2.000 × đã trả / tháng)` |
+| **Huỷ X** | xoá item **ngay**; tháng không hoàn; năm credit từ quotaMonthEnd | FROZEN tới hết quota month, fan-out tắt |
+| Resume X | charge từ `max(now, hết phần đã trả)` | cùng tháng → mở lại ledger cũ; qua tháng → kích hoạt mới |
+| Đổi term | native cùng gói nền (X ACTIVE) | giữ Used, chỉ cộng delta dương |
+| Huỷ plan | cuối kỳ, không prorate | X ENDED cùng plan |
 
-Ranh giới cốt lõi: **hạ gói thì prorate, huỷ thì không.**
+### Bốn ràng buộc cứng
 
-### Ba ràng buộc cứng
-
-1. Phải có subscription trả phí mới mua được add-on (`addOnsRequirePaidPlan`)
-2. Chu kỳ do plan quyết định — add-on bắt buộc chạy theo, không có trạng thái
-   plan tháng + add-on năm
-3. Mỗi lúc chỉ giữ một tier X
+1. Phải có gói nền đã trả tiền mới mua được X (`addOnsRequirePaidPlan`, và gói
+   nền không được đang trial)
+2. X bám interval của gói nền
+3. Một X mỗi tenant, quantity 1
+4. Capacity: `Committed + Pending + 2.000 ≤ 2.500.000` (`xCommercialCeilingUnits`)
 
 ### Ngoài phạm vi
 
@@ -108,36 +105,18 @@ return { ...rule, ...itemRule, ...(override ?? {}) };
 //        toàn cục   theo họ add-on   một lần duy nhất
 ```
 
-Tầng giữa (`addOnRules`) là thứ cho phép X Social hành xử khác các add-on khác
-**mà không phải rẽ nhánh trong engine**.
+Tầng giữa (`addOnRules`) cho phép một add-on hành xử khác **mà không phải rẽ
+nhánh trong engine**. X Social không dùng nó: luồng của X do MODEL V6 chốt cứng.
 
-### Nhánh usage vs time
+### X Social: hai đồng hồ
 
-[`subscriptions.service.ts:632`](../backend/src/subscriptions/subscriptions.service.ts:632)
-rẽ theo cờ `usagePriced` của mặt hàng. Nhánh usage tự tính tiền
-([`:1022`](../backend/src/subscriptions/subscriptions.service.ts:1022)), lịch
-không tham gia vào công thức.
-
-### Thứ tự tiền: tiền trước, subscription sau
-
-[`:1146`](../backend/src/subscriptions/subscriptions.service.ts:1146)
-
-1. `customers.createBalanceTransaction(-credit)` — credit vào trước
-2. `invoiceItems.create(charge)`
-3. `invoices.create({subscription, auto_advance: false})` — hút credit ở bước 1
-4. `finalizeInvoice` → `pay` nếu còn `amount_due`
-
-Hỏng ở bước nào thì `catch` cuốn ngược lại đúng bước đó. **Chỉ khi tiền xong
-xuôi subscription mới bị đổi.** Đây là lý do không bao giờ có hoá đơn âm: credit
-bị trừ vào hoá đơn dương thay vì tạo hoá đơn âm.
-
-### Gói năm = 12 hạn mức tháng
-
-Stripe chỉ gia hạn một lần mỗi năm nên không đánh dấu được 11 mốc tháng bên trong.
-Hệ thống tự mốc theo tháng lịch
-([`allowance-cycle.ts`](../backend/src/stripe/allowance-cycle.ts)), và đồng hồ
-post mang dấu tháng nó thuộc về — đọc sang tháng mới thì trả 0. **Suy ra lúc
-đọc, không có job hẹn giờ.**
+- Tiền: Stripe prorate native — không có phép tính tay nào cho X.
+- Quota: [`quota-math.ts`](../backend/src/x-addon/quota-math.ts) — thuần hàm,
+  replay coverage từ hoá đơn đã paid, quota month cố định theo lịch, true-up gói
+  năm. [`x-addon.service.ts`](../backend/src/x-addon/x-addon.service.ts) — trạng
+  thái, ledger, capacity, cancel / resume / trial / trừ quota.
+- Reconcile chạy **mỗi lần đọc state** và khi nhận `invoice.paid`, nên webhook
+  lỡ chỉ làm grant đến muộn, không bao giờ mất hay trùng.
 
 ---
 
@@ -146,9 +125,9 @@ post mang dấu tháng nó thuộc về — đọc sang tháng mới thì trả 
 1. [`policy.types.ts`](../backend/src/policy/policy.types.ts) — hình dạng cấu hình
 2. [`policy.presets.ts`](../backend/src/policy/policy.presets.ts) — giá trị chốt
 3. [`subscription.util.ts:64`](../backend/src/subscriptions/subscription.util.ts:64) `classifyChange` — nhận diện tình huống → chọn rule
-4. [`subscriptions.service.ts:591`](../backend/src/subscriptions/subscriptions.service.ts:591) `change()` — cửa vào
-5. [`:1022`](../backend/src/subscriptions/subscriptions.service.ts:1022) `quoteUsageSettlement` — công thức tiền của X
-6. [`:1111`](../backend/src/subscriptions/subscriptions.service.ts:1111) `applyWithUsageSettlement` — cơ chế thanh toán
+4. [`subscriptions.service.ts`](../backend/src/subscriptions/subscriptions.service.ts) `change()` — cửa vào, rẽ sang X khi thêm/bỏ `x_social`
+5. [`x-addon/quota-math.ts`](../backend/src/x-addon/quota-math.ts) — công thức quota của X
+6. [`x-addon/x-addon.service.ts`](../backend/src/x-addon/x-addon.service.ts) — vòng đời X
 
 ---
 
@@ -156,8 +135,8 @@ post mang dấu tháng nó thuộc về — đọc sang tháng mới thì trả 
 
 | Hạng mục | Tình trạng ở demo | Cần làm ở SCIO |
 |---|---|---|
-| **Đếm post thật** | đồng hồ chỉnh tay (`PUT /api/accounts/:id/usage`) | nối vào hệ thống đếm post thật; engine đọc qua `accounts.readUsage()` nên chỉ cần thay nguồn |
-| **Trial của X** | **chưa dựng** | 14 ngày / 200 post / mỗi tài khoản một lần / chỉ khi plan nền là gói tháng |
+| **Đếm post thật** | ô nhập tay (`POST /api/x-addon/:id/sync-runs`) | mỗi lần fetch X gọi cùng hàm với số Post X thật trả về và tính phí, `actionId` là id của SyncRun |
+| **Compliance / fan-out** | chỉ có cờ `fanOut` | Global Batch Compliance, XAA `post.delete`, lease 24 giờ nằm ngoài billing |
 | **Webhook** | không có secret → dunning tự động không chạy | cấu hình `STRIPE_WEBHOOK_SECRET` |
 | **Auth** | không có, mọi endpoint mở | bắt buộc |
 | **Test clock** | dùng để tua thời gian | production không có; bỏ đường `nowFor()` hoặc để nó trả về giờ thật |
@@ -166,9 +145,11 @@ post mang dấu tháng nó thuộc về — đọc sang tháng mới thì trả 
 
 ## 8. Đã kiểm chứng tới đâu
 
-`node scripts/verify.mjs` — **151 assertion, chạy trên Stripe test mode thật**,
-không phải mock. Bao gồm luồng X Social, lật hạn mức theo tháng, chặn hoá đơn âm,
-ràng buộc add-on cần plan.
+`node scripts/verify.mjs` — **chạy trên Stripe test mode thật**, không phải
+mock: plan, màn hình, add-on theo đơn vị, chặn hoá đơn âm, ràng buộc add-on cần
+plan. X Social theo MODEL V6 có bộ riêng `node scripts/verify-x-v6.mjs` (test
+clock đặt đúng ngày của ví dụ trong model) và `node scripts/test-x-quota.mjs`
+(phép tính quota, không cần Stripe).
 
 > Suite **đổi preset toàn cục** trong lúc chạy và reset về `optisigns_default` ở
 > cuối. Đừng chạy khi đang có người test trên cùng backend.
@@ -179,7 +160,7 @@ ràng buộc add-on cần plan.
 
 | Bẫy | Hậu quả | Cách tránh |
 |---|---|---|
-| `billing_cycle_anchor: 'now'` **re-price mọi dòng đang gắn** | dòng X đã settle tay bị tính thêm theo ngày | gỡ dòng usage ra → đổi term → gắn lại, cả ba bước `proration_behavior: 'none'` |
+| Replay coverage sai thứ tự | huỷ rồi resume trong cùng một giây bị đọc thành mất coverage | sắp theo `created` rồi số hoá đơn; trong một hoá đơn dòng âm trước, dòng dương sau |
 | Đọc thời gian bằng đồng hồ máy | account có test clock bị tính sai prorate | mọi lần đọc giờ đi qua `stripe.nowFor(testClockId)` |
 | Nuốt lỗi khi đọc subscription | tạo trùng subscription thứ hai | chỉ `resource_missing`/404 mới coi là "không có"; lỗi khác phải ném |
 | `create_prorations` thì balance không đổi | tưởng credit không được cấp | đo bằng chênh lệch dòng proration giữa hai lần preview, với `proration_date` ghim cố định |

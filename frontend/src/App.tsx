@@ -6,7 +6,7 @@ import InvoicesPanel from './components/InvoicesPanel';
 import PolicyPanel from './components/PolicyPanel';
 import EventsPanel from './components/EventsPanel';
 import TimeMachine from './components/TimeMachine';
-import UsageMeter from './components/UsageMeter';
+import XAddonPanel from './components/XAddonPanel';
 
 const TABS = [
   { key: 'subscription', label: 'Subscription' },
@@ -132,7 +132,7 @@ export default function App() {
             run={run}
             busy={busy}
           />
-          {activeId && <UsageMeter accountId={activeId} state={state} run={run} busy={busy} />}
+          {activeId && <XAddonPanel accountId={activeId} state={state} run={run} busy={busy} />}
           {activeId && <TimeMachine accountId={activeId} run={run} busy={busy} refreshToken={refreshToken} />}
         </aside>
 

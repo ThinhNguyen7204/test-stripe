@@ -7,6 +7,8 @@
  *   (credit) → refund-on-downgrade policy → monthly→yearly switch →
  *   scheduled downgrade → renewal via time travel → refund → cancellation
  *
+ * The X Social add-on (MODEL V6) is covered by scripts/verify-x-v6.mjs.
+ *
  * Usage: node scripts/verify.mjs [--keep]
  *
  * Run it alone. The billing policy is a single shared document, and the suite
@@ -888,266 +890,31 @@ const run = async () => {
   await POST('/policy/presets/optisigns_default');
   if (!KEEP) await DELETE(`/accounts/${bkid}`);
 
-  step('18c · X Social: a metered add-on priced by allowance, not by days');
-  const xAccount = await POST('/accounts', {
-    email: `xsocial+${Date.now()}@optisigns-billing-demo.test`,
-    name: 'X Social Bot',
-    withTestClock: true,
-  });
-  const xid = xAccount._id;
-  await POST(`/accounts/${xid}/payment-method/test`, { kind: 'visa' });
-  await POST(`/subscriptions/${xid}/change`, { planCode: 'pro_plus', term: 'monthly', screens: 2, addOns: [] });
-
-  const xBought = await POST(`/subscriptions/${xid}/change`, {
-    planCode: 'pro_plus', term: 'monthly', screens: 2, addOns: [{ code: 'x_social_standard', quantity: 1 }],
-  });
-  check('First purchase is settled on allowance, not on days', xBought.applied === 'usage_settlement' &&
-    xBought.chargeCents === 1000, `${money(xBought.chargeCents)} — a full allowance`);
-
-  let xBlocked = false;
-  try {
-    await POST(`/subscriptions/${xid}/change`, {
-      planCode: 'pro_plus', term: 'monthly', screens: 2,
-      addOns: [{ code: 'x_social_standard', quantity: 1 }, { code: 'x_social_pro', quantity: 1 }],
-      quotaUsed: 0,
-    });
-  } catch (err) {
-    xBlocked = /tiers of the same add-on/i.test(err.message);
-  }
-  check('Two tiers can never be held at once', xBlocked);
-
   /*
-   * A meter nobody has written to means nothing has been posted yet, which is a
-   * real reading of zero rather than a missing one — previewed here so the
-   * account is left on the tier the rest of this step expects.
+   * The X Social add-on follows MODEL V6 and has a suite of its own —
+   * scripts/verify-x-v6.mjs — because its quota lives on a calendar quota
+   * month that only a test clock set to the model's own dates can check.
    */
-  const xNoMeter = await POST(`/subscriptions/${xid}/preview`, {
-    planCode: 'pro_plus', term: 'monthly', screens: 2, addOns: [{ code: 'x_social_pro', quantity: 1 }],
-  });
-  check('An untouched meter reads as zero posts, not as missing data',
-    xNoMeter.quota.used === 0 && xNoMeter.breakdown.creditCents === 1000,
-    `${money(xNoMeter.breakdown.creditCents)} = ${xNoMeter.breakdown.creditFormula}`);
-
-  await POST(`/simulator/${xid}/advance`, { seconds: 15 * 86400 });
-  const xInvoicesBefore = (await GET(`/billing/accounts/${xid}/invoices`)).length;
-
-  /*
-   * MODEL V5: the unused half of a 600-post allowance is worth $10 × 400/600 =
-   * $6.67 whatever the calendar says, while the new tier is billed for the days
-   * that remain. Stripe cannot do the first half of that sum.
-   */
-  const xUp = await POST(`/subscriptions/${xid}/change`, {
-    planCode: 'pro_plus', term: 'monthly', screens: 2,
-    addOns: [{ code: 'x_social_pro', quantity: 1 }], quotaUsed: 200,
-  });
-  check('Both directions run one rule: addOnTierChange', xUp.ruleKey === 'addOnTierChange' &&
-    xUp.applied === 'usage_settlement', `${xUp.ruleKey} · ${xUp.applied}`);
-  check('Credit is the unspent allowance, not the unused days',
-    xUp.creditCents === Math.round(1000 * 400 / 600),
-    `${money(xUp.creditCents)} = ${xUp.workings.creditFormula}`);
-  /*
-   * 15 of 30 days are gone, so half the allowance month is still ahead. MODEL
-   * V5 row 47 sells that half: the price and the posts are cut by the same
-   * fraction, which is what keeps the rate per post the same whenever in the
-   * month the customer arrives.
-   */
-  const upFraction = xUp.workings.remainingFraction;
-  check('About half the allowance month is still ahead',
-    Math.abs(upFraction - 0.5) < 0.03, `${(upFraction * 100).toFixed(1)}%`);
-  check('The new tier is sold by the slice of the month that is left',
-    xUp.chargeCents === Math.round(3000 * upFraction),
-    `${money(xUp.chargeCents)} = ${xUp.workings.chargeFormula}`);
-  check('The posts granted are cut by the very same fraction',
-    xUp.quota.granted === Math.floor(2000 * upFraction),
-    `${xUp.quota.granted} posts = ${xUp.workings.quotaFormula}`);
-
-  const xAfterUp = await GET(`/subscriptions/${xid}`);
-  check('The line is repriced, not replaced', xAfterUp.stripe.items.length === 2 &&
-    xAfterUp.current.addOns.some((a) => a.code === 'x_social_pro'),
-    `${xAfterUp.stripe.items.length} items · ${JSON.stringify(xAfterUp.current.addOns)}`);
-
-  const xInvoices = await GET(`/billing/accounts/${xid}/invoices`);
-  check('Exactly one invoice was raised, and it is positive',
-    xInvoices.length === xInvoicesBefore + 1 && xInvoices[0].total === xUp.chargeCents,
-    `${xInvoices[0].number} ${money(xInvoices[0].total)}`);
-  check('The credit absorbed part of it instead of becoming a negative invoice',
-    xInvoices[0].amountPaid === xUp.chargeCents - xUp.creditCents && xInvoices.every((i) => i.total >= 0),
-    `card paid ${money(xInvoices[0].amountPaid)} of ${money(xInvoices[0].total)}`);
-
-  // and back down: same rule, same shape, bigger credit
-  const xDown = await POST(`/subscriptions/${xid}/change`, {
-    planCode: 'pro_plus', term: 'monthly', screens: 2,
-    addOns: [{ code: 'x_social_standard', quantity: 1 }], quotaUsed: 500,
-  });
-  check('Downgrading uses the same rule', xDown.ruleKey === 'addOnTierChange', xDown.ruleKey);
-  /*
-   * MODEL V5 row 8 values the hand-back against what was *actually* invoiced
-   * for this item this period, which after a mid-month purchase is not the list
-   * price — so the figure has to be the one the step above really charged.
-   */
-  check('The hand-back is valued against the invoice the step above raised',
-    xDown.workings.invoicedForCycle === xUp.chargeCents,
-    `${money(xDown.workings.invoicedForCycle)} invoiced vs ${money(xUp.chargeCents)} charged`);
-  check('And it hands back the unspent share of the posts granted',
-    xDown.creditCents === Math.round((xUp.chargeCents * (xUp.quota.granted - 500)) / xUp.quota.granted),
-    `${money(xDown.creditCents)} = ${xDown.workings.creditFormula}`);
-  check('Still no negative invoice anywhere',
-    (await GET(`/billing/accounts/${xid}/invoices`)).every((i) => i.total >= 0));
-
-  step('18c-2 · The usage meter feeds the price, and resets when a new allowance is granted');
-  await PUT(`/accounts/${xid}/usage`, { family: 'x_social', used: 150 });
-  const meterPreview = await POST(`/subscriptions/${xid}/preview`, {
-    planCode: 'pro_plus', term: 'monthly', screens: 2, addOns: [{ code: 'x_social_pro', quantity: 1 }],
-  });
-  const meterCap = meterPreview.quota?.allowance ?? 0;
-  check('A request with no usage figure reads the meter',
-    meterPreview.quota?.used === 150 &&
-      meterPreview.breakdown.creditCents ===
-        Math.round((xDown.chargeCents * (meterCap - 150)) / meterCap),
-    `used ${meterPreview.quota?.used} of ${meterCap} → ${money(meterPreview.breakdown.creditCents)}`);
-
-  const overridden = await POST(`/subscriptions/${xid}/preview`, {
-    planCode: 'pro_plus', term: 'monthly', screens: 2,
-    addOns: [{ code: 'x_social_pro', quantity: 1 }], quotaUsed: 600,
-  });
-  check('A request can still override the meter', overridden.breakdown.creditCents === 0,
-    `${money(overridden.breakdown.creditCents)} with the whole allowance spent`);
-
-  /*
-   * On the first instant of a period the time left is exactly one cycle, and
-   * counting that as a month "ahead" would hand back a month the customer is
-   * still sitting in — an off-by-one that pays out real money.
-   */
-  check('The month in progress is not also counted as a month ahead',
-    meterPreview.breakdown.monthsAhead === 0,
-    `monthsAhead=${meterPreview.breakdown.monthsAhead} on a monthly term`);
-
-  const xRebuy = await POST(`/subscriptions/${xid}/change`, {
-    planCode: 'pro_plus', term: 'monthly', screens: 2, addOns: [{ code: 'x_social_pro', quantity: 1 }],
-  });
-  const meterAfter = await GET(`/accounts/${xid}`);
-  check('A new allowance resets the meter', (meterAfter.usage?.x_social ?? 0) === 0,
-    JSON.stringify(meterAfter.usage));
-
-  step('18d · Carrying a usage-priced add-on across a change of term');
-  /*
-   * Resetting the billing cycle re-prices every line that is attached at that
-   * moment, so the usage-priced line has to be detached first — otherwise
-   * Stripe bills it by the calendar on top of the allowance already paid for.
-   */
-  await PUT(`/accounts/${xid}/usage`, { family: 'x_social', used: 1500 });
-  const xTerm = await POST(`/subscriptions/${xid}/change`, {
-    planCode: 'pro_plus', term: 'yearly', screens: 2,
-    addOns: [{ code: 'x_social_standard', quantity: 1 }], quotaUsed: 100,
-  });
-  check('The add-on is valued against what the monthly term really charged for it',
-    xTerm.workings.invoicedForCycle === xRebuy.chargeCents &&
-      xTerm.creditCents ===
-        Math.round((xRebuy.chargeCents * (xRebuy.quota.granted - 100)) / xRebuy.quota.granted),
-    `${money(xTerm.creditCents)} = ${xTerm.workings.creditFormula}`);
-  /*
-   * A yearly term buys twelve allowances, but the one in progress is still only
-   * worth the part of it that is left — so it is eleven whole months plus a
-   * slice, not twelve whole months.
-   */
-  check('And bought at the new term: the month in progress by the slice, then eleven whole',
-    xTerm.chargeCents === Math.round(900 * xTerm.workings.remainingFraction) + 900 * 11,
-    `${money(xTerm.chargeCents)} = ${xTerm.workings.chargeFormula}`);
-
-  const xTermInvoices = await GET(`/billing/accounts/${xid}/invoices`);
-  const xProrationLines = xTermInvoices
-    .flatMap((i) => i.lines)
-    .filter((l) => l.proration && (l.description ?? '').includes('X Social'));
-  check('Stripe never priced the add-on by the calendar', xProrationLines.length === 0,
-    xProrationLines.map((l) => `${l.description} ${money(l.amount)}`).join(' · ') || 'no calendar lines');
-  const xTermState = await GET(`/subscriptions/${xid}`);
-  check('The add-on came back on the new term', xTermState.current.term === 'yearly' &&
-    xTermState.current.addOns.some((a) => a.code === 'x_social_standard'),
-    `${xTermState.current.term} · ${JSON.stringify(xTermState.current.addOns)}`);
-
-  step('18d-2 · A yearly term holds twelve monthly allowances, and spent months are forfeited');
-  /*
-   * Stripe renews a yearly subscription once, so it cannot mark the eleven
-   * month boundaries inside the period. The meter carries the month it belongs
-   * to and reads zero again once that month has passed, which is also why the
-   * leftovers of an elapsed month are never credited.
-   */
-  const rollAccount = await POST('/accounts', {
-    email: `rollover+${Date.now()}@optisigns-billing-demo.test`,
-    name: 'Allowance Rollover',
-    withTestClock: true,
-  });
-  const rollId = rollAccount._id;
-  await POST(`/accounts/${rollId}/payment-method/test`, { kind: 'visa' });
-  await POST(`/subscriptions/${rollId}/change`, {
-    planCode: 'standard', term: 'yearly', screens: 1, addOns: [],
-  });
-  await POST(`/subscriptions/${rollId}/change`, {
-    planCode: 'standard', term: 'yearly', screens: 1,
-    addOns: [{ code: 'x_social_standard', quantity: 1 }],
-  });
-
-  const rollCycle = async () => (await GET(`/subscriptions/${rollId}`)).usageCycle?.x_social ?? {};
-  const m1 = await rollCycle();
-  check('A yearly term reads as twelve allowance months',
-    m1.monthsInPeriod === 12 && m1.index === 0 && m1.monthsAhead === 11,
-    `month ${m1.index + 1}/${m1.monthsInPeriod}, ${m1.monthsAhead} ahead`);
-
-  await PUT(`/accounts/${rollId}/usage`, { family: 'x_social', used: 400 });
-  await POST(`/simulator/${rollId}/advance`, { preset: 'one_month' });
-  const m2 = await rollCycle();
-  check('The meter starts over at the next allowance month, not at the next invoice',
-    m2.index === 1 && m2.used === 0 && m2.monthsAhead === 10,
-    `month ${m2.index + 1}/12 reads ${m2.used}/${m2.allowance}, ${m2.monthsAhead} ahead`);
-
-  await PUT(`/accounts/${rollId}/usage`, { family: 'x_social', used: 400 });
-  await POST(`/simulator/${rollId}/advance`, { preset: 'one_month' });
-  await PUT(`/accounts/${rollId}/usage`, { family: 'x_social', used: 400 });
-  const m3 = await rollCycle();
-  check('Three months in, the meter holds only this month', m3.index === 2 && m3.used === 400,
-    `month ${m3.index + 1}/12 reads ${m3.used}/${m3.allowance}`);
-
-  const rollQuote = await POST(`/subscriptions/${rollId}/preview`, {
-    planCode: 'standard', term: 'monthly', screens: 1,
-    addOns: [{ code: 'x_social_standard', quantity: 1 }],
-  });
-  check('Settling counts this month by posts and the rest by whole months',
-    rollQuote.breakdown.creditCents === Math.round(900 * 200 / 600) + 900 * 9,
-    `${money(rollQuote.breakdown.creditCents)} = ${rollQuote.breakdown.creditFormula}`);
-  check('The 400 posts left unspent in months 1 and 2 are credited at nothing',
-    rollQuote.breakdown.creditCents === 8400,
-    `${money(rollQuote.breakdown.creditCents)} — two elapsed months would add ${money(2 * Math.round(900 * 200 / 600))} if carried`);
-  if (!KEEP) await DELETE(`/accounts/${rollId}`);
-
   step('18e · An add-on needs a plan underneath it');
-  let xNoPlan = false;
+  const npAccount = await POST('/accounts', {
+    email: `noplan+${Date.now()}@optisigns-billing-demo.test`,
+    name: 'No Plan Bot',
+    withTestClock: true,
+  });
+  const npid = npAccount._id;
+  await POST(`/accounts/${npid}/payment-method/test`, { kind: 'visa' });
+  await POST(`/subscriptions/${npid}/change`, { planCode: 'pro_plus', term: 'monthly', screens: 2, addOns: [] });
+  let noPlan = false;
   try {
-    await POST(`/subscriptions/${xid}/change`, {
-      planCode: 'pro_plus', term: 'yearly', screens: 0,
-      addOns: [{ code: 'x_social_standard', quantity: 1 }], quotaUsed: 0,
+    await POST(`/subscriptions/${npid}/change`, {
+      planCode: 'pro_plus', term: 'monthly', screens: 0,
+      addOns: [{ code: 'video_wall', quantity: 1 }],
     });
   } catch (err) {
-    xNoPlan = /sit on top of a paid plan/i.test(err.message);
+    noPlan = /sit on top of a paid plan/i.test(err.message);
   }
-  check('Zero screens means no add-ons', xNoPlan);
-
-  // cancelling is governed by the per-add-on override, not the global rule
-  const xBalanceBeforeCancel = (await GET(`/accounts/${xid}/balance`)).balance;
-  // 18d left this account on the annual term; asking for monthly here as well
-  // would make the term switch the headline change and the per-add-on rule
-  // would never get a say, so only the add-on moves.
-  const xCancel = await POST(`/subscriptions/${xid}/change`, {
-    planCode: 'pro_plus', term: 'yearly', screens: 2, addOns: [],
-  });
-  check('Cancelling is scheduled for the boundary by the per-add-on rule',
-    xCancel.applied === 'scheduled' && xCancel.rule.timing === 'end_of_period',
-    `${xCancel.applied} · ${xCancel.rule.timing}`);
-  check('The add-on stays usable until then', xCancel.state.current.addOns.length === 1,
-    JSON.stringify(xCancel.state.current.addOns));
-  check('And nothing is handed back for it',
-    (await GET(`/accounts/${xid}/balance`)).balance === xBalanceBeforeCancel,
-    money(xBalanceBeforeCancel));
-  if (!KEEP) await DELETE(`/accounts/${xid}`);
+  check('Zero screens means no add-ons', noPlan);
+  if (!KEEP) await DELETE(`/accounts/${npid}`);
 
   step('19 · Audit trail');
   const events = await GET(`/events?accountId=${id}&limit=100`);

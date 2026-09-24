@@ -33,35 +33,17 @@ export interface CatalogItemDef {
   /** add-on quantity may never exceed the number of screens on the base plan */
   boundToScreens?: boolean;
   /**
-   * Add-ons that come in tiers share a family. Two items in the same family are
-   * never held at once: moving between them swaps the price on the existing
-   * subscription item instead of deleting one line and adding another.
-   */
-  family?: string;
-  /**
    * Licensed against the account rather than against a screen, so the
-   * add-on ≤ screens rule does not apply. It says nothing about how many the
-   * customer may hold: a per-account add-on with no ceiling is sold in
-   * whole-number quantities like any other (MODEL V5 row 4), and one that is
-   * genuinely single-seat says so with an explicit maxQuantity of one.
+   * add-on ≤ screens rule does not apply.
    */
   perAccount?: boolean;
   /**
-   * Metered entitlement granted each month *per unit of quantity*, e.g. Monthly
-   * Post Updates. Quantity multiplies it, so the cap a customer actually holds
-   * is `quotaAllowance × quantity` (MODEL V5 row 4).
+   * Post Updates a fully paid quota month grants. Informational on the price
+   * book: the X add-on's quota ledger is SCIO's (MODEL V6 row 6) and follows
+   * paid TIME, never quantity or money — see x-addon/quota-math.ts.
    */
   quotaAllowance?: number;
   quotaLabel?: string;
-  /**
-   * Sold as an allowance rather than as time. Taking one part-way through a
-   * month buys the part of the month that is left: the price and the allowance
-   * are cut by the same remaining fraction (MODEL V5 row 47), so the rate per
-   * post is the same whenever in the month the customer arrives. What is owed
-   * back is the share of the *granted* allowance left unspent, valued against
-   * what was actually invoiced for it (MODEL V5 row 8).
-   */
-  usagePriced?: boolean;
   features: string[];
 }
 
@@ -184,48 +166,33 @@ export const ADDONS: CatalogItemDef[] = [
 ];
 
 /**
- * X Social — the metered add-on. Two tiers of the same product, priced per
- * account, and unlike every other add-on its unused value is measured in posts
- * rather than in days (MODEL V5).
+ * X Social — MODEL V6 row 4: exactly one add-on per tenant, quantity fixed at
+ * 1, $20 a month or $216 a year ($20 × 12 × 90%). No tiers, no quantity: the
+ * Standard/Pro split and per-licence quantity of V5 are gone (row 48).
+ *
+ * Money is Stripe's and is prorated natively like any other item. Quota is
+ * SCIO's: 2,000 Post Updates for each fully paid calendar quota month, granted
+ * by paid time (rows 5, 6, 47).
  */
-export const X_SOCIAL_ADDONS: CatalogItemDef[] = [
-  {
-    code: 'x_social_standard',
-    kind: 'addon',
-    name: 'X Social Standard',
-    description: 'Pull X (Twitter) content onto your screens. 600 post updates a month, up to 10 profiles.',
-    unitLabel: 'account',
-    tierRank: 1,
-    monthlyCents: 1000,
-    annualMonthlyCents: 900,
-    minQuantity: 0,
-    family: 'x_social',
-    perAccount: true,
-    quotaAllowance: 600,
-    quotaLabel: 'Monthly Post Updates',
-    usagePriced: true,
-    features: ['600 Monthly Post Updates', 'Up to 10 profiles', 'Unlimited hashtag sources'],
-  },
-  {
-    code: 'x_social_pro',
-    kind: 'addon',
-    name: 'X Social Pro',
-    description: 'Pull X (Twitter) content onto your screens. 2,000 post updates a month, up to 25 profiles.',
-    unitLabel: 'account',
-    tierRank: 2,
-    monthlyCents: 3000,
-    annualMonthlyCents: 2700,
-    minQuantity: 0,
-    family: 'x_social',
-    perAccount: true,
-    quotaAllowance: 2000,
-    quotaLabel: 'Monthly Post Updates',
-    usagePriced: true,
-    features: ['2,000 Monthly Post Updates', 'Up to 25 profiles', 'Unlimited hashtag sources'],
-  },
-];
+export const X_SOCIAL_ADDON: CatalogItemDef = {
+  code: 'x_social',
+  kind: 'addon',
+  name: 'X Social',
+  description:
+    'Pull X (Twitter) content onto your screens. 2,000 Post Updates each quota month, up to 10 Profile Sources, one per account.',
+  unitLabel: 'account',
+  tierRank: 0,
+  monthlyCents: 2000,
+  annualMonthlyCents: 1800,
+  minQuantity: 0,
+  maxQuantity: 1,
+  perAccount: true,
+  quotaAllowance: 2000,
+  quotaLabel: 'Post Updates',
+  features: ['2,000 Post Updates per quota month', 'Up to 10 Profile Sources', 'Hashtag Sources', 'One per account'],
+};
 
-export const CATALOG: CatalogItemDef[] = [...PLANS, ...ADDONS, ...X_SOCIAL_ADDONS];
+export const CATALOG: CatalogItemDef[] = [...PLANS, ...ADDONS, X_SOCIAL_ADDON];
 
 export const FREE_PLAN_CODE = 'free';
 export const ANNUAL_DISCOUNT_PERCENT = 10;

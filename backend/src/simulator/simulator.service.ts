@@ -84,30 +84,12 @@ export class SimulatorService {
     const { clock: settled, steps } = await this.advanceInSteps(account.testClockId, target);
 
     // Stripe has now done its billing work: pull the result back into Mongo.
-    const periodStartBefore = account.currentPeriodStart;
+    // (The X add-on's quota is reconciled by getState() below, from the paid
+    // invoices this hop produced.)
     if (account.stripeSubscriptionId) {
       try {
         const sub = await this.stripe.client.subscriptions.retrieve(account.stripeSubscriptionId);
         await this.subscriptions.syncAccountFromSubscription(account, sub);
-        /*
-         * A new period means a fresh allowance, so the usage meter starts over —
-         * the same reason it resets when a new tier is granted.
-         */
-        if (periodStartBefore && account.currentPeriodStart !== periodStartBefore) {
-          for (const family of Object.keys(account.usage ?? {})) {
-            await this.accounts.resetUsage(account, family, 'the period renewed');
-          }
-        } else {
-          /*
-           * Still inside the same Stripe period, but a yearly term holds twelve
-           * monthly allowances inside it. Reading the meter settles any month
-           * boundary the hop crossed, so the log shows it now rather than when
-           * somebody next happens to price a change.
-           */
-          for (const family of Object.keys(account.usage ?? {})) {
-            await this.accounts.readUsage(account, family);
-          }
-        }
       } catch (err: any) {
         this.logger.warn(`Post-advance sync failed: ${err.message}`);
       }

@@ -68,7 +68,8 @@ nhận payload chưa ký (tiện cho demo local).
 
 ```bash
 node scripts/verify.mjs               # thêm --keep để giữ lại account trong Stripe
-node scripts/verify-x-quantity.mjs    # quantity trên X add-on (chạy riêng, không song song)
+node scripts/verify-x-v6.mjs          # X add-on theo MODEL V6 (chạy riêng, không song song)
+node scripts/test-x-quota.mjs         # phép tính quota V6, không cần Stripe (build backend trước)
 ```
 
 Script đi hết 15 bước: trial → subscribe → thêm màn hình (prorate) → add-on →
@@ -101,59 +102,56 @@ Add-on nằm chung subscription, cùng term với gói nền:
 | Background Music | screen | $15.00 | $13.50 |
 | Wireless Presentation | screen | $20.00 | $18.00 |
 
-**X Social** bán **theo account, theo số lượng nguyên, không có trần** (MODEL V5
-row 4). Quantity nhân **cả giá lẫn hạn mức post**:
+**X Social** theo **MODEL V6**: mỗi tenant **tối đa 1 add-on, quantity cố định
+bằng 1**, không còn tier Standard/Pro:
 
-| Tier | Monthly | Annual | Hạn mức / licence |
+| Add-on | Monthly | Annual | Quota |
 |---|---|---|---|
-| X Social Standard | $10.00 | $9.00 | 600 post / tháng |
-| X Social Pro | $30.00 | $27.00 | 2.000 post / tháng |
+| X Social | $20.00 | $216.00 ($20 × 12 × 90%) | 2.000 Post Updates / quota month trả đủ |
 
-Mua 4 licence Standard = $40/tháng và 2.400 post/tháng, nằm trên **một** Stripe
-subscription item duy nhất — đổi quantity là update chính item đó, không bao giờ
-tạo item mới (row 51). Đổi tier thì **giữ nguyên quantity**.
+Có **hai đồng hồ độc lập** (V6 row 6):
 
-Mua lần đầu vào **giữa tháng** thì trả theo phần tháng còn lại, và hạn mức bị
-cắt đúng bằng phân số đó — `floor(600 × quantity × phần còn lại)` (row 47). Nhờ
-vậy **giá mỗi post không phụ thuộc ngày mua**. Đây là chỗ duy nhất lịch được đụng
-tới với add-on loại này.
-
-**Tăng quantity là phép cộng, không phải thay thế.** Licence đang có giữ nguyên
-hạn mức đã bán cho chúng; chỉ licence mới được tính tiền, cho phần tháng còn lại:
+- **Tiền là của Stripe.** X là một item bình thường trên cùng subscription,
+  cùng thẻ, cùng interval với gói nền, và được **Stripe prorate native**. Mua
+  giữa kỳ thì trả phần kỳ còn lại, thu ngay (`always_invoice` +
+  `error_if_incomplete`), thẻ hỏng thì không có gì thay đổi.
+- **Quota là của SCIO**, tính trên **quota month cố định theo lịch UTC**
+  (`[ngày 1 00:00, ngày 1 tháng sau)`), không theo ngày billing của Stripe:
 
 ```
-charge     = round(đơn giá × Δ × phần còn lại)
-quotaAdded = floor(hạn mức × Δ × phần còn lại)
+GrantedTarget(Q) = floor(2.000 × giây đã trả tiền nằm trong Q / số giây của Q)
+Remaining        = max(0, Granted − Used)
 ```
 
-Hạn mức và số tiền đã xuất hoá đơn **cộng dồn**, đồng hồ post **không bị reset**,
-và **không phát credit** — nhờ vậy mua thêm licence không bao giờ làm giảm số post
-khả dụng. Nếu cuối tháng còn quá ít thời gian để bán được post nào (`quotaAdded`
-bằng 0) thì **không thu tiền**, licence mới có hiệu lực từ tháng hạn mức kế tiếp.
+Thời gian đã trả tiền đọc lại từ **các dòng X trên hoá đơn đã `paid`** (chưa
+`invoice.paid` thì chưa có quota) và lấy **hợp** các khoảng, nên đổi Monthly →
+Yearly không bao giờ cấp trùng. Renewal hay đổi interval **không reset Used**,
+chỉ cộng phần delta dương. Gói năm vẫn cấp theo từng quota month (1.733 +
+11 × 2.000 + 267 = 24.000 cho kỳ 05/09 → 05/09, tháng cuối được true-up).
 
-**Gỡ hẳn add-on** (về 0) là **huỷ**, không phải giảm: nó chạy tới hết kỳ đã trả và
-**không hoàn đồng nào** (row 49). Trong lúc chờ, licence vẫn dùng được và hạn mức
-vẫn còn; nút **Call it off** trên banner *Scheduled change* huỷ lịch đó và trả
-subscription về nguyên trạng — bật lại add-on **không** làm được việc này, vì
-subscription vẫn đang giữ add-on nên request bị coi là "không có gì thay đổi".
+| Thao tác | Tiền (Stripe) | Quota (SCIO) |
+|---|---|---|
+| Mua giữa quota month | prorate tới billing boundary, thu ngay | `floor(2.000 × phần đã trả / tháng)` — mua 15/09, trả tới 01/10 → **1.066** |
+| Renewal giữa quota month | Stripe thu kỳ mới | cộng phần còn thiếu vào **cùng** ledger (580 → +1.420 = 2.000) |
+| Monthly ⇄ Yearly (X đang ACTIVE) | native proration cùng gói nền | giữ Used, chỉ tăng nếu coverage tăng |
+| **Cancel X** | xoá item **ngay**. Monthly: `proration_behavior=none`, không hoàn. Yearly: `proration_date = quotaMonthEnd` → credit phần từ quotaMonthEnd vào customer balance | **FROZEN** tới quotaMonthEnd, tắt fan-out, giải phóng capacity |
+| **Resume** cùng quota month | re-add item, charge từ `max(now, paidThrough)` — Monthly không thu trùng, Yearly debit lại đúng mốc đã credit | mở lại **đúng ledger cũ** (Granted/Used giữ nguyên) sau khi payment thành công |
+| Resume sau quotaMonthEnd | như mua mới | quota cũ hết hạn, tháng mới cấp theo paid coverage |
+| Hạ gói nền về Free | cuối kỳ đã trả, không prorate | X chạy tới boundary rồi ENDED cùng gói nền |
+| Payment fail | không có coverage mới | chỉ dùng phần đã grant, qua paidThrough thì dừng fetch; trả được thì cộng delta |
 
-**Giảm quantity, đổi tier, đổi term** vẫn chạy luồng thay thế của row 8: credit
-bằng `số tiền thực sự đã xuất hoá đơn cho tháng này × post chưa tiêu / hạn mức đã
-cấp` — **không** phải theo giá niêm yết, và cả hai vế là con số **cộng dồn** của
-mọi lần mua trong tháng đó.
+**Trial X** (row 50): 14 ngày, 200 Post Updates trong ledger riêng, một lần mỗi
+account, **chỉ Manual Refresh**, không có Stripe item. Mua add-on thì trial kết
+thúc, số dư trial không chuyển sang.
 
-Gói năm trả trước cho **12 hạn mức tháng**: tháng đang dở tính theo phần còn lại,
-các tháng **thực sự còn lại** của kỳ tính trọn vẹn — đổi vào tháng thứ 4 thì thu 8
-tháng, không phải 11. Đồng hồ post lật sang hạn mức mới ở mỗi mốc tháng bên
-trong năm, và **post thừa của tháng đã qua thì mất** — không dồn sang tháng sau,
-không quy ra tiền. Các tháng phía sau chưa đụng tới thì hoàn trọn tháng.
+**Trừ quota** (row 12): theo số Post X **thực trả về và tính phí** — hỏi 50, X
+trả 12 thì trừ 12 — clamp bởi Remaining, **exactly-once** theo `actionId`. Hết
+quota thì không gọi provider nữa, không tính overage.
 
-**Capacity guard** (row 17): tổng dung lượng đã bán trên toàn hệ thống —
-`600 × Σ quantity Standard + 2.000 × Σ quantity Pro + 200 × số trial đang chạy` —
-bị **chặn** khi vượt `constraints.capacityBlockAtUnits` (mặc định 2.400.000) và
-cảnh báo từ `capacityWarnAtUnits` (2.100.000). Guard chạy **trước khi tạo hoá
-đơn** (row 48) nên bị từ chối thì không có gì phải hoàn tác, và **không** áp cho
-thao tác giảm vì giảm chỉ trả lại dung lượng (row 63).
+**Capacity admission** (row 17): trước khi gọi Stripe, tenant giữ một
+reservation 2.000 (TTL 15 phút); `Committed + Pending + 2.000 ≤ 2.500.000` mới
+được bán; paid thì commit, fail/hết hạn thì release. 500.000 còn lại tới hard cap
+3.000.000 là buffer không bán. Đổi interval không reserve thêm.
 
 **Enterprise** ($45.00 / $40.50, tối thiểu 25 màn hình) là kênh "Talk With
 Sales" nên không dựng trong demo self-serve này — thêm lại bằng một entry trong
@@ -169,18 +167,17 @@ không add-on, add-on tính theo màn hình không vượt quá số màn hình.
 
 Tab **Billing policy** trong UI (hoặc `GET/PUT /api/policy`) chỉnh:
 
-- **9 change rule** — `screensIncrease`, `screensDecrease`, `planUpgrade`,
-  `planDowngrade`, `addOnIncrease`, `addOnDecrease`, `addOnTierChange`,
-  `termToYearly`, `termToMonthly`. Mỗi rule có `timing`, `prorationBehavior`,
+- **8 change rule** — `screensIncrease`, `screensDecrease`, `planUpgrade`,
+  `planDowngrade`, `addOnIncrease`, `addOnDecrease`, `termToYearly`,
+  `termToMonthly`. Mỗi rule có `timing`, `prorationBehavior`,
   `billingCycleAnchor`, `paymentBehavior`, `creditHandling`.
   `creditHandling` có 5 giá trị: `customer_balance` (để nguyên chỗ Stripe đặt),
   `push_to_account_balance` (luôn hiện thành account credit),
   `refund_to_payment_method` (hoàn về thẻ), `none` (thu hồi credit),
   `block` (**từ chối** thao tác nếu nó khiến công ty phải trả lại tiền).
-  Riêng `addOnTierChange` có thêm `creditBasis`: `time` tính theo ngày còn lại,
-  `quota` tính theo hạn mức chưa tiêu — X Social dùng `quota`.
-- **Per-add-on override** (`addOnRules`) — đè rule riêng cho từng họ add-on,
-  ví dụ bỏ X Social thì đặt lịch cuối kỳ và không hoàn gì.
+- **Per-add-on override** (`addOnRules`) — đè rule riêng cho từng add-on theo
+  code. X Social **không** đi qua đây: mua / huỷ / resume của nó do MODEL V6
+  chốt cứng trong `backend/src/x-addon/`.
 - **Cancellation** — huỷ cuối kỳ hay huỷ ngay, có prorate không, phần chưa dùng
   thành credit hay hoàn về thẻ.
 - **Trial** — `appliesTo` (`only_without_payment_method` như OptiSigns / `always` /
@@ -192,14 +189,15 @@ Tab **Billing policy** trong UI (hoặc `GET/PUT /api/policy`) chỉnh:
 - **Refunds** — cửa sổ ngày, credit note hay refund thuần, cho phép refund một
   phần, trần tự động duyệt.
 - **Constraints** — min/max số lượng, quan hệ add-on ↔ màn hình, cho phép về 0
-  màn hình, và **add-on bắt buộc phải có subscription trả phí** mới mua được.
+  màn hình, **add-on bắt buộc phải có subscription trả phí** mới mua được, và
+  capacity của X (`xCommercialCeilingUnits`, `xProviderHardCapUnits`).
 - **Dunning** — làm gì khi `invoice.payment_failed`, `pause_collection.behavior`.
 
 ### 6 preset dựng sẵn
 
 | Preset | Hành vi |
 |---|---|
-| `scio_portal_mvp` | **Phạm vi migrate sang SCIO Portal**: Standard plan 1 màn hình + X Social Standard/Pro, tháng hoặc năm. Hạ tier thì hoàn hạn mức chưa tiêu về credit; **huỷ thì không hoàn gì** và chạy tới hết kỳ |
+| `scio_portal_mvp` | **Phạm vi migrate sang SCIO Portal**: Standard plan + X Social (MODEL V6), tháng hoặc năm. Hạ gói nền về Free có hiệu lực cuối kỳ đã trả; X chạy tới boundary đó |
 | `optisigns_default` | Mọi credit ở lại trong Stripe dưới dạng **account credit**, không refund về thẻ. Prorate dồn vào hoá đơn kỳ sau; riêng **yearly → monthly áp dụng ngay** và phần năm chưa dùng thành credit |
 | `charge_immediately` | Mọi thay đổi xuất hoá đơn và thu tiền ngay |
 | `annual_commitment` | Upgrade ngay, mọi thao tác giảm — kể cả yearly → monthly — phải chờ tới kỳ gia hạn (subscription schedule), không hoàn tiền |
@@ -249,19 +247,17 @@ mà không cần đổi policy chung.
    hạ `maxAutoApproveCents` hoặc `windowDays` để thấy API chặn đúng luật.
 9. **Pause theo mùa** — *Pause (seasonal)*: `pause_collection` với behavior lấy
    từ policy, tương ứng luồng OnHold của OptiSigns.
-10. **X Social đo theo post** — mua X Social Pro, nhập số post đã tiêu vào ô
-    ngay dòng *Metered add-ons* (hoặc card **Usage meter** ở sidebar), rồi hạ về
-    Standard: credit bằng `tiền đã xuất hoá đơn × post chưa tiêu / hạn mức đã
-    cấp`. Đồng hồ post là nút vặn cho **mức dùng**, đúng kiểu Time machine là nút
-    vặn cho **thời gian**.
-10b. **Quantity trên X add-on** — ô *licences* ngay dưới hàng tier: tăng lên 4 thì
-    giá và hạn mức cùng ×4 trên một item. Tua nửa tháng rồi tăng tiếp: hoá đơn
-    chỉ thu phần tháng còn lại và hạn mức cấp ra cũng cắt đúng phân số đó. Hạ
-    xuống thì phần chưa tiêu quy thành credit theo số tiền đã thu thật. Kịch bản
-    đầy đủ: `node scripts/verify-x-quantity.mjs`.
-11. **Gói năm lật hạn mức từng tháng** — X Social gói năm, nhập 400 post rồi tua
-    một tháng: đồng hồ về `0/600` và post thừa tháng cũ **mất luôn**. Tới tháng
-    3 hạ tier thì credit chỉ tính tháng 3 cộng 9 tháng chưa đụng tới.
+10. **X Social theo MODEL V6** — tạo account có test clock, mua Standard, tua
+    tới giữa tháng rồi bật **X Social: On**: preview hiện hoá đơn Stripe prorate
+    và quota `floor(2.000 × ngày đã trả / ngày của quota month)`. Khối **X
+    add-on** ở cột trái hiện status, quota month, Granted/Used/Remaining,
+    paidThrough và capacity.
+10b. **Provider fetch** — trong khối X add-on chọn Initial/Auto/Manual, nhập
+    *asked* và *returned*: quota trừ theo *returned*, clamp theo Remaining.
+10c. **Cancel → Resume** — *Cancel X*: tenant FROZEN tới hết quota month. Gói
+    tháng không hoàn; gói năm credit từ quotaMonthEnd. *Resume X* trong cùng
+    quota month mở lại đúng ledger cũ; tua qua ngày 1 rồi resume thì là kích hoạt
+    mới. Kịch bản đầy đủ: `node scripts/verify-x-v6.mjs`.
 
 Tab **Activity log** ghi lại mọi thao tác: rule nào được áp, policy lúc đó ra
 sao, payload gửi sang Stripe là gì và Stripe trả về gì.
@@ -273,15 +269,12 @@ sao, payload gửi sang Stripe là gì và Stripe trả về gì.
 | Method | Endpoint | Việc |
 |---|---|---|
 | `GET` | `/api/catalog` | bảng giá + trạng thái sync |
-| `PATCH` | `/api/catalog/:code` | sửa allowance của add-on đo theo usage (`quotaAllowance`, `quotaLabel`) |
 | `POST` | `/api/catalog/sync-stripe` | tạo/cập nhật product & price trên Stripe |
-| `POST` | `/api/catalog/reseed?force=true` | trả allowance về mặc định trong code |
+| `POST` | `/api/catalog/reseed` | ghi lại bảng giá từ code vào Mongo |
 | `GET/POST` | `/api/accounts` | danh sách / tạo account (kèm test clock) |
 | `POST` | `/api/accounts/:id/payment-method/test` | gắn thẻ test (`visa`, `declined`, `authentication_required`, …) |
 | `POST` | `/api/accounts/:id/checkout-setup` | Checkout session mode=setup để nhập thẻ thật |
 | `GET/POST` | `/api/accounts/:id/balance` | xem / điều chỉnh customer balance |
-| `PUT` | `/api/accounts/:id/usage` | đặt đồng hồ mức dùng (`{family, used}`) — nguồn cho credit của add-on đo theo usage |
-| `POST` | `/api/accounts/:id/usage/consume` | tiêu thêm (`{family, amount}`) |
 | `GET` | `/api/subscriptions/:id` | trạng thái subscription + schedule |
 | `POST` | `/api/subscriptions/:id/preview` | **dry-run**: hoá đơn Stripe sẽ tạo + giải thích rule |
 | `POST` | `/api/subscriptions/:id/change` | áp thay đổi theo policy |
@@ -295,6 +288,10 @@ sao, payload gửi sang Stripe là gì và Stripe trả về gì.
 | `GET/PUT` | `/api/policy` | đọc / sửa billing policy |
 | `POST` | `/api/policy/presets/:key` | áp preset |
 | `POST` | `/api/simulator/:id/advance` | tua test clock |
+| `GET` | `/api/x-addon/:id` | X add-on: status, quota month, ledger, paidThrough, coverage, capacity (reconcile từ hoá đơn đã paid) |
+| `POST` | `/api/x-addon/:id/preview/:action` | dry-run `purchase` \| `cancel` \| `resume` |
+| `POST` | `/api/x-addon/:id/cancel` \| `/resume` \| `/trial` | vòng đời X theo MODEL V6 |
+| `POST` | `/api/x-addon/:id/sync-runs` | một lần fetch provider `{kind, requested, returned, actionId}` — trừ quota exactly-once |
 | `POST` | `/api/webhooks/stripe` | webhook (raw body, có verify chữ ký) |
 | `GET` | `/api/events` | nhật ký audit |
 
@@ -310,6 +307,7 @@ backend/src/
   subscriptions/phân loại thay đổi → dựng item → update / schedule / cancel
   billing/      hoá đơn, refund, credit note, customer portal
   simulator/    test clock
+  x-addon/      X Social MODEL V6: quota ledger theo quota month, capacity, cancel/resume/trial
   webhooks/     nhận sự kiện, sync ngược về Mongo, thực thi dunning
   events/       audit log (policy + payload + kết quả)
 ```
@@ -326,10 +324,10 @@ desired state → validate ràng buộc → classifyChange() → rule = policy +
 ## 7. Giới hạn đã biết
 
 - **Không có auth.** Mọi endpoint đều mở — demo chạy local, đừng expose ra ngoài.
-- **Trial riêng của X Social chưa dựng** — theo MODEL V5 là *14 ngày / 200 post /
-  mỗi tài khoản một lần / chỉ khi plan nền là gói tháng*. Trial ở mức plan thì đã
-  chạy. Đây là phần còn thiếu duy nhất trong phạm vi
-  [SCIO Portal MVP](docs/scio-portal-mvp.md).
+- **X add-on chỉ mô phỏng phần billing/quota của MODEL V6.** Không gọi X API:
+  provider fetch là ô nhập tay (`/x-addon/:id/sync-runs`), fan-out là một cờ
+  trạng thái. Global Batch Compliance, XAA `post.delete`, compliance lease 24 giờ
+  và Profile cap 10 không nằm trong demo này.
 - **Không có webhook secret** trong cấu hình mặc định, nên các hành động dunning
   tự động không tự kích hoạt.
 - `billing_mode` chỉ đặt được lúc tạo subscription (giới hạn của Stripe). Đổi

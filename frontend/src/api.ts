@@ -17,9 +17,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   catalog: () => request<any>('/catalog'),
   syncCatalog: () => request<any>('/catalog/sync-stripe', { method: 'POST' }),
-  updateCatalogItem: (code: string, patch: any) =>
-    request<any>(`/catalog/${code}`, { method: 'PATCH', body: JSON.stringify(patch) }),
-  resetAllowances: () => request<any>('/catalog/reseed?force=true', { method: 'POST' }),
 
   accounts: () => request<any[]>('/accounts'),
   createAccount: (body: any) => request<any>('/accounts', { method: 'POST', body: JSON.stringify(body) }),
@@ -28,10 +25,6 @@ export const api = {
   attachTestCard: (id: string, kind: string) =>
     request<any>(`/accounts/${id}/payment-method/test`, { method: 'POST', body: JSON.stringify({ kind }) }),
   balance: (id: string) => request<any>(`/accounts/${id}/balance`),
-  setUsage: (id: string, family: string, used: number) =>
-    request<any>(`/accounts/${id}/usage`, { method: 'PUT', body: JSON.stringify({ family, used }) }),
-  consumeUsage: (id: string, family: string, amount: number) =>
-    request<any>(`/accounts/${id}/usage/consume`, { method: 'POST', body: JSON.stringify({ family, amount }) }),
   adjustBalance: (id: string, amountCents: number, description: string) =>
     request<any>(`/accounts/${id}/balance`, { method: 'POST', body: JSON.stringify({ amountCents, description }) }),
   portalSession: (id: string) =>
@@ -52,6 +45,15 @@ export const api = {
   pause: (id: string) => request<any>(`/subscriptions/${id}/pause`, { method: 'POST', body: JSON.stringify({}) }),
   unpause: (id: string) => request<any>(`/subscriptions/${id}/unpause`, { method: 'POST' }),
   renewalPreview: (id: string) => request<any>(`/subscriptions/${id}/renewal-preview`),
+
+  // the X add-on, MODEL V6
+  xPreview: (id: string, action: 'purchase' | 'cancel' | 'resume') =>
+    request<any>(`/x-addon/${id}/preview/${action}`, { method: 'POST' }),
+  xCancel: (id: string) => request<any>(`/x-addon/${id}/cancel`, { method: 'POST' }),
+  xResume: (id: string) => request<any>(`/x-addon/${id}/resume`, { method: 'POST' }),
+  xTrial: (id: string) => request<any>(`/x-addon/${id}/trial`, { method: 'POST' }),
+  xSyncRun: (id: string, body: { kind: string; requested?: number; returned: number; actionId?: string }) =>
+    request<any>(`/x-addon/${id}/sync-runs`, { method: 'POST', body: JSON.stringify(body) }),
 
   invoices: (id: string) => request<any[]>(`/billing/accounts/${id}/invoices`),
   payInvoice: (invoiceId: string) => request<any>(`/billing/invoices/${invoiceId}/pay`, { method: 'POST' }),

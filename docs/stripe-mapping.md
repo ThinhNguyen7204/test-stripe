@@ -184,44 +184,35 @@ trông như đang bật nhưng không bao giờ chạy tới:
 
 Cả 5 preset dựng sẵn đều cho 0 cảnh báo.
 
-## 2d. Add-on đo theo mức dùng: khi Stripe không tính hộ được
+## 2d. X Social (MODEL V6): tiền native, quota riêng
 
-Stripe chỉ biết định giá phần chưa dùng **theo thời gian**. Với add-on bán kèm
-một allowance (X Social: 600 hoặc 2.000 Monthly Post Updates mỗi tháng), phần
-khách còn lại đo bằng **allowance**, và Stripe không thấy con số đó.
+X là một item thường trên subscription, nên **Stripe tính tiền theo thời gian như
+mọi item** — không còn nhánh tự dựng dòng tiền theo hạn mức. MODEL V6 chỉ chốt
+cứng tham số của ba thao tác (code: `backend/src/x-addon/x-addon.service.ts`):
 
-Vì vậy rule `addOnTierChange` đặt `creditBasis: 'quota'` và
-`proration_behavior: 'none'`, rồi app tự dựng dòng tiền:
+| Thao tác | `subscriptions.update` |
+|---|---|
+| Mua | `items: [{price, quantity: 1}]`, `proration_behavior: always_invoice`, `proration_date: now`, `payment_behavior: error_if_incomplete` |
+| Huỷ — Monthly | `items: [{id, deleted: true}]`, `proration_behavior: none` |
+| Huỷ — Yearly | `items: [{id, deleted: true}]`, `proration_behavior: always_invoice`, **`proration_date: quotaMonthEnd`** |
+| Resume | `items: [{price, quantity: 1}]`; nếu `max(now, hết phần đã trả)` < cuối kỳ thì `always_invoice` + `proration_date` = mốc đó + `error_if_incomplete`, ngược lại `none` |
+| Đổi interval | không có luật riêng: item X đổi price cùng gói nền theo rule `termToYearly` / `termToMonthly` |
 
-```
-1. customers.createBalanceTransaction   −(giá cũ × chưa dùng / allowance)
-2. invoiceItems.create                  +(giá mới × ngày còn / ngày kỳ)
-3. invoices.create + finalize + pay     hoá đơn luôn DƯƠNG, credit tự trừ
-4. subscriptions.update                 đổi price trên item cũ, proration none
-```
+Đo được trên test mode (X năm $216 mua 05/09/2026, huỷ 20/09):
 
-Thứ tự đó là cố ý: **tiền đi trước, subscription đi sau**. Nếu thu tiền hỏng thì
-rollback (void hoá đơn, ghi ngược credit) và khách vẫn ở tier cũ — không có
-trạng thái "đã lên tier nhưng chưa trả tiền".
+- Stripe **chấp nhận `proration_date` ở tương lai** trên item, miễn là nằm trong
+  kỳ hiện tại: hoá đơn huỷ có đúng một dòng `−$200.61` kỳ `2026-10-01 →
+  2027-09-05`, tự `paid`, ghi vào customer balance. Việc xoá item thì vẫn xảy ra
+  **ngay**.
+- Resume với cùng `proration_date` tạo dòng `+$200.61` đúng kỳ đó; hoá đơn trả
+  bằng balance nên `amount_due = $0`.
 
-Ba điều dễ làm sai:
-
-- **Reset chu kỳ định giá lại mọi dòng đang gắn.** `billing_cycle_anchor: 'now'`
-  kết thúc kỳ cho cả subscription và Stripe tính tiền từng dòng còn gắn ở thời
-  điểm đó — loại khỏi mảng `items` **không** cứu được, nó chỉ nghĩa là "đừng
-  sửa dòng này". Đo được: Stripe cộng thêm `Remaining time on X Social Pro
-  $17.75` lên trên $324 đã settle tay. Cách chữa: **tháo dòng đó ra** trước khi
-  đổi term, xong rồi gắn lại ở giá mới, cả hai bước với `proration_behavior:
-  'none'`.
-
-- **Đổi tier không được là xoá dòng cũ + thêm dòng mới.** Làm vậy Stripe sẽ tự
-  credit tier cũ theo thời gian, đúng thứ ta đang cố tránh. `buildItems` nhận ra
-  hai code cùng `family` và **đổi price trên item sẵn có**.
-- **`proration_behavior` phải là `none`.** Để `always_invoice` là khách bị tính
-  tiền hai lần cho cùng số ngày. Bộ lint chặn tổ hợp này.
-- **Preview phải dùng đúng phép tính của app**, không hỏi Stripe. Hỏi Stripe sẽ
-  nhận về một hoá đơn không có proration nào, đọc thành "đổi tier miễn phí".
-  Preview và lúc áp dụng gọi chung một hàm `quoteTierChange` để không lệch nhau.
+**Quota không đọc từ Stripe mà suy ra từ Stripe**: SCIO replay các dòng X trên
+mọi hoá đơn `status = paid` theo thứ tự tạo (trong cùng một hoá đơn, dòng âm
+trước, dòng dương sau), lấy hợp các kỳ thành *paid coverage*, rồi
+`Granted = floor(2.000 × coverage ∩ quota month / quota month)`. Replay nên
+idempotent: webhook `invoice.paid` tới hai lần, hay đọc state mỗi lần mở trang,
+đều ra cùng một kết quả.
 
 ## 3. Cancellation
 

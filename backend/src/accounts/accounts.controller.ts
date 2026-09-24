@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Post, Put } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AccountsService, TEST_PAYMENT_METHODS } from './accounts.service';
 
@@ -54,17 +54,6 @@ export class AccountsController {
   checkoutSetup(@Param('id') id: string, @Body() body: { returnUrl?: string }) {
     const fallback = this.config.get<string>('frontendUrl') ?? 'http://localhost:5555';
     return this.accounts.createSetupCheckoutSession(id, body?.returnUrl ?? fallback);
-  }
-
-  /** Simulated usage meter — the stand-in for whatever meters real usage. */
-  @Put(':id/usage')
-  setUsage(@Param('id') id: string, @Body() body: { family: string; used: number }) {
-    return this.accounts.setUsage(id, body.family, body.used);
-  }
-
-  @Post(':id/usage/consume')
-  consumeUsage(@Param('id') id: string, @Body() body: { family: string; amount: number }) {
-    return this.accounts.consumeUsage(id, body.family, body.amount ?? 1);
   }
 
   @Get(':id/balance')

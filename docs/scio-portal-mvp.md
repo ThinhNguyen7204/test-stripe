@@ -4,166 +4,175 @@ Bản chi tiết cho đợt migrate sang SCIO Portal. Quy tắc đầy đủ c�
 [business-rules.md](business-rules.md); file này chỉ nói **phần nào được mang sang**
 và phần đó chạy ra sao.
 
-> **Chốt phạm vi:** portal chỉ bán **Standard plan (1 màn hình)** và **X add-on
-> (2 tier: Standard, Pro)**, chạy cả **tháng và năm**. Cơ chế tính tiền **giữ
-> nguyên** hệ thống billing/payment đã dựng và đã đo trên Stripe test mode —
-> không có luật mới nào phát sinh cho portal.
+> **Chốt phạm vi (MODEL V6):** portal bán **Standard plan** và **một X add-on**
+> ($20/tháng hoặc $216/năm, **quantity cố định 1**, mỗi tenant tối đa một), chạy
+> cả **tháng và năm**. Tiền do **Stripe** quản và prorate native; quota do
+> **SCIO** quản trên **quota month cố định theo lịch**. Nguồn: sheet *Suggestion*
+> → tab **MODEL V6**.
+
+Mọi con số "đo thật" dưới đây lấy từ `node scripts/verify-x-v6.mjs` chạy trên
+Stripe test mode với test clock đặt đúng ngày của ví dụ trong MODEL V6.
 
 ---
 
 ## 1. Danh mục bán
 
-| Mặt hàng | Tháng | Năm (−10%) | Hạn mức |
+| Mặt hàng | Tháng | Năm | Quota |
 |---|---|---|---|
-| **Standard plan** | $10.00 | $9.00/tháng → $108/năm | 1 màn hình |
-| **X Social Standard** | $10.00 | $9.00/tháng → $108/năm | 600 post/tháng |
-| **X Social Pro** | $30.00 | $27.00/tháng → $324/năm | 2.000 post/tháng |
+| **Standard plan** | $10.00 / màn hình | $108 / màn hình / năm | — |
+| **X Social** | **$20.00** | **$216.00** ($20 × 12 × 90%) | **2.000 Post Updates** mỗi quota month trả đủ |
 
-Mỗi gói Standard là **1 màn hình**. Portal MVP không bán thêm màn hình, nên hai
-luật `thêm màn hình` / `bớt màn hình` không có đường chạm tới.
-
----
-
-## 2. Ba ràng buộc cứng
-
-1. **Phải có plan mới mua được add-on.** Không có subscription trả phí thì không
-   mua được X, ở bất kỳ tier nào. Hệ thống chặn ngay khi nhận request.
-2. **Chu kỳ do plan quyết định.** Plan chuyển sang năm thì X **bắt buộc** chuyển
-   theo. Không tồn tại trạng thái plan tháng + add-on năm — cấu trúc dữ liệu chỉ
-   có **một** trường chu kỳ cho cả subscription.
-3. **Mỗi lúc chỉ giữ một tier X.** Không thể vừa Standard vừa Pro.
+Không còn X Social Standard / Pro, không còn tăng giảm quantity (V6 row 48).
+Quantity khác 1 bị chặn ở UI, API, và nếu Stripe có lệch thì reconcile tự đưa về
+1, ghi cảnh báo, không cấp thêm quota (EASY 5).
 
 ---
 
-## 3. Mua và nâng — thu ngay
+## 2. Hai đồng hồ độc lập
 
-| Thao tác | Cách tính | Thu |
+| | Stripe | SCIO |
 |---|---|---|
-| Mua X lần đầu | **đủ giá, đủ hạn mức**, bất kể còn mấy ngày trong kỳ | giá gói |
-| Nâng X Standard → Pro | trả lại phần post chưa tiêu của Standard, rồi tính đủ giá Pro | phần chênh |
+| Quản cái gì | tiền, hoá đơn, credit, proration, billing anchor | quota month, Granted / Used / Remaining |
+| Mốc | ngày billing của subscription (có thể là 05, 20…) | **ngày 1 lúc 00:00 UTC** hằng tháng |
+| Nguồn sự thật | invoice preview / invoice đã paid | quota ledger (`x_quota_ledgers`) |
 
-Tiền trừ thẻ **ngay lúc bấm**, không dồn vào hoá đơn kỳ sau. **Thẻ hỏng thì thao
-tác bị huỷ** — khách không dùng được thứ chưa trả tiền. **Ngày gia hạn không đổi.**
+```
+GrantedTarget(Q) = floor(2.000 × giây ĐÃ TRẢ TIỀN nằm trong Q / số giây của Q)
+Remaining        = max(0, Granted − Used)
+```
 
-X **không bao giờ** tính theo ngày. Mua ngày cuối tháng vẫn trả đủ giá và vẫn
-nhận đủ 600 (hoặc 2.000) post.
+- "Đã trả tiền" đọc lại từ **các dòng X trên hoá đơn đã `paid`**, lấy **hợp** các
+  khoảng. Một khoảng thời gian trả hai lần (tháng rồi đổi sang năm) chỉ tính một
+  lần — không bao giờ cấp trùng.
+- Granted **chỉ tăng**: renewal, retry thanh toán, đổi interval chỉ cộng delta
+  dương, **không reset Used**.
+- Qua ngày 1 là ledger mới; phần chưa dùng của tháng cũ **mất**, không rollover.
+- Discount / coupon không làm giảm quota: quota theo **thời gian** đã trả, không
+  theo số tiền (row 54).
 
 ---
 
-## 4. Hạ gói — prorate rồi trả về credit
+## 3. Ràng buộc cứng
 
-Chỉ **hạ gói** mới được prorate. Trong MVP điều đó nghĩa là **X Pro → X Standard**
-(plan chỉ có một bậc nên không có đường hạ).
+1. **Phải có gói nền đã trả tiền.** Gói nền đang Stripe trial thì không mua được
+   X. X được thêm vào **subscription đã có**, không gộp vào lúc tạo subscription
+   mới (row 51).
+2. **X bám interval của gói nền.** Không có trạng thái plan tháng + X năm.
+3. **Mua / huỷ / resume X đi riêng**, không gộp với thay đổi khác — mỗi thao tác
+   có mốc proration, reservation và cổng thanh toán riêng.
+4. **Capacity** (row 17): trước khi gọi Stripe, tenant giữ một reservation 2.000
+   (TTL 15 phút). Chỉ bán khi `Committed + Pending + 2.000 ≤ 2.500.000`; paid thì
+   commit, fail / hết hạn thì release. 500.000 tới hard cap 3.000.000 là buffer
+   không bán. Đổi interval không reserve thêm.
 
-```
-credit = giá đã mua × (post chưa tiêu / hạn mức)
-       + giá đã mua × số tháng trọn chưa đụng tới   (chỉ gói năm)
-```
+---
 
-Tiền trả lại vào **credit Stripe của khách**, **không hoàn về thẻ**. Phần credit
-dư so với gói mới nằm lại chờ trừ dần vào các hoá đơn sau.
+## 4. Mua X
 
-**Đo thật** — X Pro gói tháng, đã tiêu 1.500/2.000 post, hạ về Standard:
+Stripe prorate từ lúc mua tới billing boundary, **thu ngay** (`always_invoice`,
+`error_if_incomplete`). Thẻ hỏng thì Stripe từ chối: không có item, không quota,
+reservation được trả lại. Quota chỉ mở **sau khi hoá đơn paid**.
+
+**Đo thật** — gói nền neo ngày 01, mua X ngày 15/09:
 
 | | |
 |---|---|
-| credit trả lại | $30.00 × 500/2.000 = **$7.50** |
-| tính gói Standard | **$10.00** đủ giá |
-| thẻ thực trừ | **$2.50** |
-
-Đổi tier xong, **hạn mức cũ về 0 và cấp hạn mức mới** của tier mới.
+| Stripe thu | **$10.67** ($20 × 16/30) |
+| Quota tháng 9 | floor(2.000 × 16/30) = **1.066** |
+| Sang 01/10, renewal paid | ledger mới **2.000**, Used = 0 |
 
 ---
 
-## 5. Huỷ — không prorate
+## 5. Billing anchor khác quota month
 
-| Thao tác | Kết quả |
+**Đo thật** — mua ngày 10/09 (billing neo ngày 10):
+
+| Thời điểm | Quota |
 |---|---|
-| **Bỏ X add-on** | giữ nguyên hạn mức **tới hết kỳ**, hết kỳ mới cắt. **Không hoàn đồng nào.** |
-| **Huỷ plan** | có hiệu lực **cuối kỳ đã trả tiền**. Khách xài hết thứ đã mua nên không có gì để hoàn. |
-
-Khác biệt cốt lõi với mục 4: **hạ gói** thì được prorate, **huỷ** thì không.
+| 10/09 | tháng 9: floor(2.000 × 21/30) = **1.400** |
+| 02/10 (chưa tới renewal) | tháng 10: floor(2.000 × 9/31) = **580**, UI ghi rõ "đã cấp theo thời gian đã thanh toán", không gọi là quota bị mất |
+| 10/10 renewal paid | cộng **+1.420** vào **cùng** ledger → 2.000, Used giữ nguyên |
+| 10/11 renewal **fail** | tháng 11 chỉ có **600** (01/11 → 10/11); qua 10/11 là PAYMENT_PENDING, không fetch |
+| trả được hoá đơn | cộng **+1.400**, ACTIVE lại |
 
 ---
 
-## 6. Đổi chu kỳ
+## 6. Trừ quota
 
-Đổi một lần là **cả plan lẫn X cùng nhảy** sang chu kỳ mới.
+- Trừ theo số Post X **thực trả về và tính phí**: hỏi 50, X trả 12 → trừ **12**
+  (row 12). X trả 0 → trừ 0 (EASY 2).
+- Exactly-once theo `actionId`; mọi phép trừ bị **clamp** bởi Remaining.
+- Initial / Auto / Manual và tạo Profile Source dùng **chung một số dư**, không
+  còn AutoPool / ManualBalance / Daily Hard Cap.
+- Remaining = 0 thì **không gọi provider**, không tính overage. Cảnh báo ở 80%
+  và 100%.
 
-| | Cách tính |
+---
+
+## 7. Huỷ X — có hiệu lực ngay
+
+Xoá X item khỏi subscription **ngay**, tenant **FROZEN** và tắt fan-out; gói nền
+không đổi. Granted / Used / Remaining giữ **FROZEN tới hết quota month**.
+Capacity reservation được trả lại.
+
+| | Tiền |
 |---|---|
-| **Plan** | theo **thời gian** — phần chưa dùng quy ra tiền theo ngày |
-| **X add-on** | theo **post** — không dính dáng gì tới lịch |
+| **Monthly** | `proration_behavior=none` — **không hoàn** |
+| **Yearly** | `proration_date = quotaMonthEnd` → Stripe credit phần coverage từ quotaMonthEnd tới hết năm vào **customer balance** |
 
-**Tháng → Năm:** thu tiền cả năm ngay, trừ phần chưa dùng.
-**Năm → Tháng:** có hiệu lực ngay, phần năm chưa dùng thành credit.
+**Đo thật** — X gói năm mua 05/09/2026 (quota tháng 9 = **1.733**), huỷ ngày
+20/09: Stripe credit **$200.61** cho 01/10/2026 → 05/09/2027; tháng 9 vẫn 1.733.
 
 ---
 
-## 7. Gói năm chứa 12 hạn mức tháng
+## 8. Resume
 
-Gói năm trả trước cho **12 hạn mức**, mỗi tháng 600 (hoặc 2.000) post riêng.
-Stripe chỉ gia hạn **một lần mỗi năm** nên không đánh dấu được 11 mốc tháng bên
-trong — hệ thống tự mốc theo **tháng lịch** neo vào ngày bắt đầu kỳ.
+Charge lại từ **`max(bây giờ, hết phần đã trả)`** — không bao giờ thu trùng một
+đoạn đã trả, và với gói năm thì debit lại **đúng mốc** đã credit (EASY 1).
+Ledger chỉ mở lại **sau khi thanh toán thành công**; thẻ hỏng thì vẫn FROZEN.
 
-| | |
+| Trường hợp | Kết quả đo được |
 |---|---|
-| Sang tháng mới | đồng hồ về `0/600`, cấp hạn mức mới |
-| Post thừa tháng cũ | **mất** — không dồn sang tháng sau, không quy ra tiền |
-| Khi settle | tháng đang dùng tính theo post còn lại; các tháng phía sau hoàn trọn |
-
-**Đo thật** — X Standard gói năm ($9/tháng), tháng 1–2–3 mỗi tháng tiêu 400/600,
-tới tháng 3 mới hạ tier:
-
-| Phần | Tính | Tiền |
-|---|---|---|
-| tháng 3 đang dùng | $9 × 200/600 | **$3.00** |
-| tháng 4–12 chưa đụng | $9 × 9 | **$81.00** |
-| dư 200 post của tháng 1 và 2 | bỏ | **$0.00** |
-| | | **$84.00** vào credit |
-
-Nếu dồn dư của tháng đã qua thì con số sẽ là $90.00 — cố ý không làm vậy.
+| Monthly, huỷ 10/09, resume 15/09 | đã trả tới 01/10 → `proration_behavior=none`, **không có hoá đơn**; mở lại đúng ledger **2.000 / Used 300** |
+| Yearly, huỷ 20/09, resume 25/09 | hoá đơn **$200.61** từ 01/10, trả bằng balance (**$0 trừ thẻ**); ledger 1.733 giữ nguyên, coverage liền một năm |
+| Monthly, huỷ 20/09, resume **05/10** (qua quotaMonthEnd) | kích hoạt mới: thu **$17.42** (05/10 → 01/11), tháng 10 cấp floor(2.000 × 27/31) = **1.741**, Used 0 |
 
 ---
 
-## 8. Dùng thử — **trong phạm vi**
+## 9. Đổi interval
 
-**Trial của plan — đã dựng.** 14 ngày, chỉ cho khách **chưa gắn thẻ**; ai đã gắn
-thẻ thì tính tiền ngay. Trong trial mọi thay đổi có hiệu lực nhưng không thu
-đồng nào. Hết trial mà chưa có thẻ thì subscription bị huỷ. Kết thúc trial sớm
-được.
-
-**Trial của X add-on — CHƯA DỰNG.** Theo MODEL V5: **14 ngày / 200 post / mỗi tài
-khoản một lần / chỉ khi plan nền đang là gói tháng**. Đây là phần còn thiếu duy
-nhất của phạm vi MVP, cần dựng trước khi migrate.
+- **X đang ACTIVE:** Monthly ⇄ Yearly có hiệu lực ngay sau payment, Stripe prorate
+  native **cả gói nền lẫn X**. SCIO giữ quota month và Used, chỉ tăng Granted nếu
+  coverage hợp tăng. Đo thật: mua 15/09 (1.066), đổi sang năm ngày 20/09 → vẫn
+  **1.066**, không cộng thêm 733.
+- **X đang FROZEN:** chỉ gói nền đổi, X không bị charge / credit và vẫn frozen.
+  Resume sau đó dùng interval hiện tại của gói nền.
 
 ---
 
-## 9. Không bao giờ có hoá đơn âm
+## 10. Gói nền hạ về Free / kết thúc
 
-Trước khi gọi Stripe, hệ thống **tính thử** hoá đơn. Nếu ra số âm — tức công ty
-phải trả lại tiền — thao tác bị **từ chối**, không có gì thay đổi.
-
-Trong MVP, cửa chặn này gần như không chạm tới các luồng chính:
-
-- **X Pro → Standard** đi theo luật riêng của add-on đo theo hạn mức, trả về
-  credit chứ không tạo hoá đơn âm.
-- **Bỏ X** đặt lịch cuối kỳ, không phát sinh tiền.
-- **Hạ plan** không có đích để hạ.
-
-Nó đứng đó cho các trường hợp ngoài rìa và cho giai đoạn sau khi portal mở thêm bậc.
+Hạ gói nền về Free là **scheduled downgrade** tại cuối kỳ gói nền đã trả, không
+prorate (row 67). X chạy tiếp tới boundary đó, quota tháng cuối chỉ cấp tới
+boundary (đo thật: gói neo ngày 10 → tháng 10 được **580**), tới boundary thì X
+**ENDED** cùng gói nền và capacity được trả lại (row 55).
 
 ---
 
-## 10. Những gì **bỏ** khỏi MVP
+## 11. Dùng thử
+
+- **Trial của plan** — 14 ngày cho khách chưa gắn thẻ (giữ nguyên).
+- **Trial của X** (row 50) — **14 ngày / 200 Post Updates** trong ledger trial
+  riêng, **một lần mỗi account**, **chỉ Manual Refresh**, không Stripe item,
+  không rollover. Mua X thì trial kết thúc, số dư trial **không** chuyển sang.
+
+---
+
+## 12. Những gì **ngoài** demo billing này
 
 | | Lý do |
 |---|---|
-| Gói **Pro Plus**, **Engage** | portal chỉ bán Standard |
-| Luật `lên gói` / `hạ gói` ở mức plan | một bậc thì không có đích để nhảy |
-| **Thêm / bớt màn hình** | mỗi Standard cố định 1 màn hình |
-| Add-on theo đơn vị: **Background Music**, **Video Wall**, **Wireless Presentation** | ngoài phạm vi |
-| Gói **Free** | vẫn là trạng thái "chưa mua"; chọn Free nghĩa là **huỷ subscription** |
-
-Những phần này vẫn còn nguyên trong hệ thống và trong
-[business-rules.md](business-rules.md), chỉ là portal MVP không chạm tới.
+| Global Batch Compliance, XAA `post.delete`, compliance lease 24 giờ | phần sync/compliance, không phải billing — demo chỉ giữ cờ fan-out |
+| Profile cap 10 / tenant, canonical Source | nằm ở tầng X App, không ở billing |
+| Gọi X API thật | provider fetch là ô nhập tay `returned` |
+| Pro Plus, Engage, thêm / bớt màn hình, add-on theo đơn vị | vẫn còn trong hệ thống, portal MVP không bán |
