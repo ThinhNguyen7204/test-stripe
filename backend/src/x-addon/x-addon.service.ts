@@ -131,16 +131,14 @@ export class XAddonService {
   }
 
   /**
-   * The anchor in force. While X lives (ACTIVE, PAYMENT_PENDING, or FROZEN in the
-   * quota month it was cancelled in) it is the one recorded at activation, and a
-   * base-plan interval change does not move it. Anything that leads to a new
-   * activation — never bought, trial, cancelled past its frozen month, base plan
-   * gone — follows the base plan's current cycle instead.
+   * The anchor in force: MODEL V6's xQuotaAnchorAt. It is recorded once, when X
+   * is first charged, on the base plan's billing cycle, and it never moves again
+   * — not on an interval change, a renewal, a Cancel or buying X again (rows 46,
+   * 59, 60; operator, 2026-09-25). Only a tenant that has never bought X has no
+   * anchor, and follows the base plan's current cycle until it does.
    */
-  private quotaAnchorFor(account: AccountDocument, ctx: XSubscriptionContext, status: XStatus, now: number): number {
-    const stored = account.xAddon?.quotaAnchor;
-    const live = status === 'ACTIVE' || status === 'PAYMENT_PENDING' || status === 'FROZEN';
-    return live && stored ? stored : XAddonService.baseAnchorOf(ctx.sub, now);
+  private quotaAnchorFor(account: AccountDocument, ctx: XSubscriptionContext, _status: XStatus, now: number): number {
+    return account.xAddon?.quotaAnchor ?? XAddonService.baseAnchorOf(ctx.sub, now);
   }
 
   // -------------------------------------------------------- paid coverage
@@ -851,7 +849,7 @@ export class XAddonService {
     if (invoice?.status === 'paid') await this.commit(account.id);
     if (snap.trial?.live) await this.endTrial(account, snap.now, 'the paid add-on was bought');
     // the quota cycle starts on the base plan's billing cycle and keeps this anchor from now on
-    account.xAddon = { ...(account.xAddon ?? {}), quotaAnchor: XAddonService.baseAnchorOf(updated, snap.now) };
+    account.xAddon = { ...(account.xAddon ?? {}), quotaAnchor: account.xAddon?.quotaAnchor ?? XAddonService.baseAnchorOf(updated, snap.now) };
     account.markModified('xAddon');
     await this.accounts.save(account);
 
@@ -1021,14 +1019,8 @@ export class XAddonService {
     if (paid) await this.commit(account.id);
     const item = this.xItemOf(updated, await this.prices());
     const cleared = this.clearCancel(account.xAddon, snap.now, item?.id);
-    /*
-     * FROZEN keeps its anchor: the quota month it was cancelled in is still the
-     * one in progress, and its ledger is what FrozenRemaining restores. CANCELED
-     * is past that month — the old quota has expired, so this is a new
-     * activation and the cycle follows the base plan's billing cycle again.
-     */
-    account.xAddon =
-      snap.status === 'CANCELED' ? { ...cleared, quotaAnchor: XAddonService.baseAnchorOf(updated, snap.now) } : cleared;
+    // xQuotaAnchorAt stays where the first charge put it, whether FROZEN or past its frozen month (row 59)
+    account.xAddon = cleared;
     account.markModified('xAddon');
     await this.accounts.save(account);
 

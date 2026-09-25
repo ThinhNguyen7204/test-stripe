@@ -515,7 +515,7 @@ const run = async () => {
     t.done = true;
   });
 
-  await scenario('L', 'Monthly billing anchored on the 20th: a Cancel has nothing to credit; Buy X again after quotaMonthEnd starts on the base cycle', async () => {
+  await scenario('L', 'Monthly billing anchored on the 20th: a Cancel has nothing to credit; Buy X again after quotaMonthEnd keeps the first anchor', async () => {
     const t = await tenant('l', at(2026, 9, 20));
     await buyX(t);
     await advance(t.id, at(2026, 9, 25));
@@ -539,7 +539,7 @@ const run = async () => {
     const inv = (await invoices(t.id))[0];
     const charge = Math.round((2000 * (at(2026, 11, 20) - at(2026, 10, 25))) / (at(2026, 11, 20) - at(2026, 10, 20)));
     check('Bought again on 25/10: Stripe charges 25/10 → 20/11 (row 59, example 2)', near(inv.total, charge, 2), `${money(inv.total)} ≈ ${money(charge)}`);
-    check('A new activation follows the base cycle: quota month 20/10 → 20/11', bought.quotaMonth.start === at(2026, 10, 20) && bought.quotaMonth.end === at(2026, 11, 20),
+    check('A new activation keeps the anchor of the first charge: quota month 20/10 → 20/11', bought.quotaMonth.start === at(2026, 10, 20) && bought.quotaMonth.end === at(2026, 11, 20),
       `${day(bought.quotaMonth.start)} → ${day(bought.quotaMonth.end)}`);
     check('Granted by the new paid coverage: floor(2,000 × 26/31) = 1,677', bought.ledger?.granted === 1677, `${bought.ledger?.granted}`);
     const fresh = await xOnStripe(t.id);
@@ -652,6 +652,28 @@ const run = async () => {
       `${again.ledger?.granted} / ${again.ledger?.used}`);
     const items = await xOnStripe(t.id);
     check('One X item, the same one, at quantity 1', items.length === 1 && items[0].id === itemId && items[0].quantity === 1);
+    t.done = true;
+  });
+
+  await scenario('R', 'The quota anchor of the first charge never moves: Cancel, interval change while frozen, Buy X again later', async () => {
+    const t = await tenant('r', at(2026, 9, 1));
+    const first = (await buyX(t)).state.xAddon;
+    check('First charge on a base billed on the 1st: quota cycle 01/09 → 01/10', first.quotaMonth?.start === at(2026, 9, 1) && first.quotaMonth?.end === at(2026, 10, 1),
+      `${day(first.quotaMonth?.start)} → ${day(first.quotaMonth?.end)}`);
+    const anchor = first.quotaAnchor;
+    await advance(t.id, at(2026, 9, 10));
+    await POST(`/x-addon/${t.id}/cancel`);
+    await advance(t.id, at(2026, 9, 12));
+    const yearly = await POST(`/subscriptions/${t.id}/change`, { ...t.base, term: 'yearly', addOns: [] });
+    check('While frozen the base moves to yearly and billing restarts on 12/09', yearly.state.current.term === 'yearly' && yearly.state.stripe?.currentPeriodStart === at(2026, 9, 12),
+      day(yearly.state.stripe?.currentPeriodStart));
+    await advance(t.id, at(2026, 10, 5));
+    const again = (await buyX(t, { term: 'yearly' })).state.xAddon;
+    check('Bought again after the frozen cycle: the anchor is still the first charge\'s', again.quotaAnchor === anchor, `${day(again.quotaAnchor)} = ${day(anchor)}`);
+    check('…so the quota cycle is 01/10 → 01/11, not 12/09 → 12/10 on the new billing anchor', again.quotaMonth?.start === at(2026, 10, 1) && again.quotaMonth?.end === at(2026, 11, 1),
+      `${day(again.quotaMonth?.start)} → ${day(again.quotaMonth?.end)}`);
+    const expected = Math.floor((2000 * (at(2026, 11, 1) - at(2026, 10, 5))) / (at(2026, 11, 1) - at(2026, 10, 1)));
+    check(`Granted by the paid time inside it: floor(2,000 × 27/31) = ${expected}`, again.status === 'ACTIVE' && again.ledger?.granted === expected, `${again.ledger?.granted}`);
     t.done = true;
   });
 

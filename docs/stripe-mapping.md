@@ -193,18 +193,18 @@ the parameters of three operations (code: `backend/src/x-addon/x-addon.service.t
 | Operation | `subscriptions.update` |
 |---|---|
 | Buy | `items: [{price, quantity: 1}]`, `proration_behavior: always_invoice`, `proration_date: now`, `payment_behavior: error_if_incomplete` |
-| Cancel, `quotaMonthEnd < xPaidThrough` (monthly or yearly) | `items: [{id, quantity: 0}]`, `proration_behavior: always_invoice`, **`proration_date: quotaMonthEnd`** — credit `quotaMonthEnd → xPaidThrough`; item **kept** |
-| Cancel, `quotaMonthEnd ≥ xPaidThrough` | `items: [{id, quantity: 0}]`, `proration_behavior: none` — no future coverage to credit |
+| Cancel, `quotaCycleEnd < xPaidThrough` (monthly or yearly) | `items: [{id, quantity: 0}]`, `proration_behavior: always_invoice`, **`proration_date: quotaCycleEnd`** — credit `quotaCycleEnd → xPaidThrough`; item **kept** |
+| Cancel, `quotaCycleEnd ≥ xPaidThrough` | `items: [{id, quantity: 0}]`, `proration_behavior: none` — no future coverage to credit |
 | Cleanup at `AlreadyPaidUntil` | `items: [{id, deleted: true}]`, `proration_behavior: none`, idempotency key `x-cleanup-<item>-<attempt>` — only when the item is still quantity 0, the tenant is still FROZEN, and no purchase holds the tenant lock |
 | Buy X again before `AlreadyPaidUntil` | **same item** `items: [{id, price, quantity: 1}]`, `proration_date = AlreadyPaidUntil`, `always_invoice`; if that point is the period end then `proration_behavior: none` (no interval left to prorate) |
 | Buy X again from `AlreadyPaidUntil` onwards | `proration_date: now`, `always_invoice` — on the quantity 0 item if cleanup has not run, otherwise `items: [{price, quantity: 1}]` as in Buy |
-| Change interval | X ACTIVE: the X item changes price together with the base plan under rule `termToYearly` / `termToMonthly`. X FROZEN with the item still present: a **separate request first**, `items: [{id, price, quantity: 0}]` with `proration_behavior: none` — `quantity: 0` stated because a price change otherwise resets it — then the base plan's change without the X item. One combined request credits X for now → quotaMonthEnd (measured −$4.73), because Stripe still counts the item at quantity 1 up to the Cancel's future `proration_date` |
+| Change interval | X ACTIVE: the X item changes price together with the base plan under rule `termToYearly` / `termToMonthly`. X FROZEN with the item still present: a **separate request first**, `items: [{id, price, quantity: 0}]` with `proration_behavior: none` — `quantity: 0` stated because a price change otherwise resets it — then the base plan's change without the X item. One combined request credits X for now → quotaCycleEnd (measured −$4.73), because Stripe still counts the item at quantity 1 up to the Cancel's future `proration_date` |
 
 Measured in test mode (yearly X $216 bought 05/09/2026, cancelled 20/09):
 
 - Stripe **accepts a future `proration_date`** on an item, as long as it lies within
   the current period: the cancel invoice credits `−$198.25` for the period `2026-10-05 →
-  2027-09-05` (from quotaMonthEnd, the end of the quota month 05/09 → 05/10), automatically `paid`,
+  2027-09-05` (from quotaCycleEnd, the end of the quota cycle 05/09 → 05/10), automatically `paid`,
   written to the customer balance. The quantity change 1 → 0
   still takes effect **immediately**; the invoice also has a `$0` line "remaining time on 0 × X".
 - Buying X again with the same `proration_date` on the same item (0 → 1) re-debits exactly that
@@ -221,7 +221,7 @@ Measured in test mode (yearly X $216 bought 05/09/2026, cancelled 20/09):
 **Quota is not read from Stripe but derived from Stripe**: SCIO replays the X lines on
 every `status = paid` invoice in creation order (within the same invoice, negative lines
 first, positive lines after), takes the union of the periods as *paid coverage*, then
-`Granted = floor(2,000 × coverage ∩ quota month / quota month)`, where the quota month is stepped
+`Granted = floor(2,000 × coverage ∩ quota cycle / quota cycle)`, where the quota cycle is stepped
 in whole months from the tenant's quota anchor (`account.xAddon.quotaAnchor`) — the base plan's
 `billing_cycle_anchor` when X is first bought. An interval change sends `billing_cycle_anchor: now`
 for the money but leaves that anchor alone, so the quota cycle and the billing cycle can run apart.

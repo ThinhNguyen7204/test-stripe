@@ -107,7 +107,7 @@ at 1**; there are no longer Standard/Pro tiers:
 
 | Add-on | Monthly | Annual | Quota |
 |---|---|---|---|
-| X Social | $20.00 | $216.00 ($20 × 12 × 90%) | 2,000 Post Updates / fully paid quota month |
+| X Social | $20.00 | $216.00 ($20 × 12 × 90%) | 2,000 Post Updates / fully paid quota cycle |
 
 There are **two clocks** (V6 row 6):
 
@@ -115,9 +115,9 @@ There are **two clocks** (V6 row 6):
   same card, same interval as the base plan, and is **prorated natively by Stripe**. Buying
   mid-period pays for the remainder of the period, collected immediately (`always_invoice` +
   `error_if_incomplete`); if the card fails, nothing changes.
-- **Quota belongs to SCIO**, computed over a **quota month stepped in whole months from a
+- **Quota belongs to SCIO**, computed over a **quota cycle stepped in whole months from a
   per-tenant quota anchor** (`account.xAddon.quotaAnchor`). The anchor is the base plan's
-  `billing_cycle_anchor` at the moment X is first bought, so the quota month starts out **equal to
+  `billing_cycle_anchor` at the moment X is first bought, so the quota cycle starts out **equal to
   the billing month** (billed on the 10th → 10/09 → 10/10); the day is clamped like Stripe's
   (31/01 → 28/02 → 31/03). A base-plan interval change restarts Stripe's billing
   (`billing_cycle_anchor=now`) but **never moves the quota anchor**, so from then on the two
@@ -131,25 +131,28 @@ Remaining        = max(0, Granted − Used)
 Paid time is read back from **the X lines on `paid` invoices** (no
 `invoice.paid` means no quota yet) and takes the **union** of the intervals, so switching Monthly →
 Yearly never grants twice. Renewal or an interval change **does not reset Used**;
-it only adds the positive delta; no rollover. The yearly plan still grants per quota month:
-with aligned cycles a paid year is 12 whole quota months of 2,000 = 24,000 (yearly bought 05/09 →
-quota months on the 5th, 2,000 each).
+it only adds the positive delta; no rollover. The yearly plan still grants per quota cycle:
+with aligned cycles a paid year is 12 whole quota cycles of 2,000 = 24,000 (yearly bought 05/09 →
+quota cycles on the 5th, 2,000 each).
 
-> **Operator decision, 2026-09-25.** Anchoring the quota month to the base plan's billing anchor
-> departs from the example in MODEL V6 row 46, which reads the quota month as the calendar month
-> (the 1st at 00:00 UTC). Row 47's second example (129 + 266) and row 59's credit example are
-> therefore not reproduced: bought 30/08 on a base billed on the 5th now measures **387** in one
-> quota month 05/08 → 05/09, and a Monthly Cancel on the 20th credits nothing.
+> **Quota anchor — MODEL V6 row 46 and the operator, 2026-09-25.** The tab's third revision gives
+> each tenant a quota cycle anchored at `xQuotaAnchorAt`, stepped in calendar-month anniversaries and
+> never moved. The tab places the anchor at X's activation; the operator places it on the **base
+> plan's billing cycle at X's first charge**, and this demo implements that reading (the API still
+> names the cycle `quotaMonth`). The two differ only for a first purchase mid billing period: bought
+> 30/08 on a base billed on the 5th measures **387** in one quota cycle 05/08 → 05/09. The tab's
+> examples with a quota cycle on the 15th and billing on the 20th (333 then +1,667; a Cancel crediting
+> 15/10 → 20/10) arise here once an interval change has moved billing off the anchor.
 
 | Action | Money (Stripe) | Quota (SCIO) |
 |---|---|---|
-| Buy mid quota month | prorate to the billing boundary, collected immediately | `floor(2,000 × paid portion / month)` — base billed on the 1st, buy 15/09, paid through 01/10 → **1,066**; bought 10/09 on a base billed on the 10th → the full **2,000** for 10/09 → 10/10 |
-| Renewal | Stripe collects the new period | with aligned cycles the renewal opens the next quota month at **2,000**, Used 0; once the cycles run apart, any shortfall is added to the **same** ledger |
+| Buy mid quota cycle | prorate to the billing boundary, collected immediately | `floor(2,000 × paid portion / month)` — base billed on the 1st, buy 15/09, paid through 01/10 → **1,066**; bought 10/09 on a base billed on the 10th → the full **2,000** for 10/09 → 10/10 |
+| Renewal | Stripe collects the new period | with aligned cycles the renewal opens the next quota cycle at **2,000**, Used 0; once the cycles run apart, any shortfall is added to the **same** ledger |
 | Monthly ⇄ Yearly (X is ACTIVE) | native proration together with the base plan; Stripe restarts billing | the quota anchor does not move; keep Used, only increase if coverage increases |
-| **Cancel X** | **keep the same item, quantity 1 → 0** (not deleted immediately), for both Monthly and Yearly: if `quotaMonthEnd < xPaidThrough` then `proration_date = quotaMonthEnd` → credit `quotaMonthEnd → xPaidThrough` to the customer balance; otherwise `proration_behavior=none`, no credit. Never credit the part of the quota month in progress. With aligned cycles a Monthly Cancel has no future coverage (`quotaMonthEnd = xPaidThrough`); a credit arises only on Yearly, or after an interval change has moved billing away from the quota cycle | **FROZEN** until quotaMonthEnd, fan-out off, capacity released; FrozenRemaining is kept; store `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)` |
+| **Cancel X** | **keep the same item, quantity 1 → 0** (not deleted immediately), for both Monthly and Yearly: if `quotaCycleEnd < xPaidThrough` then `proration_date = quotaCycleEnd` → credit `quotaCycleEnd → xPaidThrough` to the customer balance; otherwise `proration_behavior=none`, no credit. Never credit the part of the quota cycle in progress. With aligned cycles a Monthly Cancel has no future coverage (`quotaCycleEnd = xPaidThrough`); a credit arises only on Yearly, or after an interval change has moved billing away from the quota cycle | **FROZEN** until quotaCycleEnd, fan-out off, capacity released; FrozenRemaining is kept; store `AlreadyPaidUntil = min(oldPaidThrough, quotaCycleEnd)` |
 | **Cleanup** at `AlreadyPaidUntil` | delete the quantity-0 item with `proration_behavior=none` — no money moves anywhere; retry on error, alert after 24 hours | only runs when the item is still quantity 0, the tenant is still FROZEN and no purchase is in progress (locked per tenant) |
-| **Buy X again** before `AlreadyPaidUntil` | **no separate restore button** — turning X back on is a purchase; **same item 0 → 1** with `proration_date = AlreadyPaidUntil`: no double charge, whatever was credited is debited back at exactly that point | restore **FrozenRemaining** (Granted/Used as before) after payment succeeds, still expires at quotaMonthEnd |
-| Buy X again from `AlreadyPaidUntil` onward | new activation, Stripe prorates normally from the time of purchase — reuses the quantity-0 item if cleanup has not run, otherwise creates a new item | that month's quota is granted per paid coverage; after quotaMonthEnd (CANCELED) the new activation re-anchors to the base plan's **current** billing cycle |
+| **Buy X again** before `AlreadyPaidUntil` | **no separate restore button** — turning X back on is a purchase; **same item 0 → 1** with `proration_date = AlreadyPaidUntil`: no double charge, whatever was credited is debited back at exactly that point | restore **FrozenRemaining** (Granted/Used as before) after payment succeeds, still expires at quotaCycleEnd |
+| Buy X again from `AlreadyPaidUntil` onward | new activation, Stripe prorates normally from the time of purchase — reuses the quantity-0 item if cleanup has not run, otherwise creates a new item | that cycle's quota is granted per paid coverage; the quota anchor of the first charge is **kept** — measured: first charged on a base billed on the 1st, base moved to yearly on 12/09 while frozen, bought again 05/10 → quota cycle 01/10 → 01/11, granted 1,741 |
 | Downgrade the base plan to Free | at the end of the paid period, no prorate | X runs until the boundary, then ENDED together with the base plan |
 | Payment fail | no new coverage | only the already granted amount is usable; fetching stops past paidThrough; once paid, the delta is added |
 
@@ -262,14 +265,14 @@ without changing the global policy.
    from the policy, corresponding to OptiSigns' OnHold flow.
 10. **X Social per MODEL V6** — create an account with a test clock, buy Standard, advance
     to mid-month, then turn on **X Social: On**: the preview shows the prorated Stripe invoice
-    and the quota `floor(2,000 × paid days / days in the quota month)`. The **X
-    add-on** block in the left column shows status, quota month, Granted/Used/Remaining,
+    and the quota `floor(2,000 × paid days / days in the quota cycle)`. The **X
+    add-on** block in the left column shows status, quota cycle, Granted/Used/Remaining,
     paidThrough and capacity.
 10b. **Provider fetch** — in the X add-on block pick Initial/Auto/Manual, enter
     *asked* and *returned*: quota is deducted by *returned*, clamped by Remaining.
-10c. **Cancel → Buy X again** — *Cancel X*: the tenant is FROZEN until the end of the quota month, and the X
+10c. **Cancel → Buy X again** — *Cancel X*: the tenant is FROZEN until the end of the quota cycle, and the X
     item on Stripe is **kept, with quantity set to 0** until `AlreadyPaidUntil`; only the
-    `quotaMonthEnd → xPaidThrough` portion is credited, if it exists (a Monthly X with aligned
+    `quotaCycleEnd → xPaidThrough` portion is credited, if it exists (a Monthly X with aligned
     cycles never has it; a Yearly X bought 05/09 and cancelled 20/09 is credited **$198.25** for
     05/10/2026 → 05/09/2027). *Buy X again* (or turning X back on) before that point takes
     that same item from 0 to 1 and restores FrozenRemaining; advancing past that point means the item
@@ -305,7 +308,7 @@ at that moment, what payload was sent to Stripe and what Stripe returned.
 | `GET/PUT` | `/api/policy` | read / edit the billing policy |
 | `POST` | `/api/policy/presets/:key` | apply a preset |
 | `POST` | `/api/simulator/:id/advance` | advance the test clock |
-| `GET` | `/api/x-addon/:id` | X add-on: status, quota month, ledger, paidThrough, coverage, capacity (reconciled from paid invoices) |
+| `GET` | `/api/x-addon/:id` | X add-on: status, quota cycle, ledger, paidThrough, coverage, capacity (reconciled from paid invoices) |
 | `POST` | `/api/x-addon/:id/preview/:action` | dry-run `purchase` \| `cancel` (buying again after Cancel is also `purchase`) |
 | `POST` | `/api/x-addon/:id/cancel` \| `/trial` | X lifecycle per MODEL V6 — Cancel takes the item to quantity 0; there is no resume route; buying again goes through `/subscriptions/:id/change` |
 | `POST` | `/api/x-addon/:id/sync-runs` | one provider fetch `{kind, requested, returned, actionId}` — deducts quota exactly-once |
@@ -324,7 +327,7 @@ backend/src/
   subscriptions/classify change → build items → update / schedule / cancel
   billing/      invoices, refunds, credit notes, customer portal
   simulator/    test clock
-  x-addon/      X Social MODEL V6: quota ledger per anchored quota month, capacity, cancel/buy again/trial
+  x-addon/      X Social MODEL V6: quota ledger per anchored quota cycle, capacity, cancel/buy again/trial
   webhooks/     receive events, sync back to Mongo, execute dunning
   events/       audit log (policy + payload + result)
 ```

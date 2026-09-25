@@ -64,16 +64,16 @@ Choose the **`scio_portal_mvp`** preset (Billing policy tab, or
 | Code | Name | Monthly | Yearly | Notes |
 |---|---|---|---|---|
 | `standard` | Standard plan | $10.00 | $108/year | per screen |
-| `x_social` | X Social | **$20.00** | **$216/year** | fixed quantity 1, 2,000 Post Updates / quota month |
+| `x_social` | X Social | **$20.00** | **$216/year** | fixed quantity 1, 2,000 Post Updates / quota cycle |
 
 ### Rules (MODEL V6)
 
 | Operation | Money (Stripe) | Quota (SCIO) |
 |---|---|---|
 | Buy X | prorate to the billing boundary, collect immediately, if the card fails nothing changes | reserve 2,000 first; paid → grant `floor(2,000 × paid / month)` |
-| **Cancel X** | same item **quantity 1 → 0**, not deleted immediately; credit `quotaMonthEnd → xPaidThrough` only when `quotaMonthEnd < xPaidThrough`, for both monthly and yearly (with aligned cycles a monthly Cancel has nothing to credit) | FROZEN until the end of the quota month, fan-out off, FrozenRemaining kept |
-| Cleanup | at `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)`: delete the quantity 0 item, `proration_behavior=none`, retry for up to 24 hours | only when still FROZEN, still quantity 0, and no purchase is in progress |
-| Buy X again | there is no restore button; it is a purchase — before `AlreadyPaidUntil` the same item goes 0 → 1, with no double charge | before `AlreadyPaidUntil` → restore FrozenRemaining; from then on → new activation, reusing the quantity 0 item if it still exists; past quotaMonthEnd it re-anchors to the base plan's current billing cycle |
+| **Cancel X** | same item **quantity 1 → 0**, not deleted immediately; credit `quotaCycleEnd → xPaidThrough` only when `quotaCycleEnd < xPaidThrough`, for both monthly and yearly (with aligned cycles a monthly Cancel has nothing to credit) | FROZEN until the end of the quota cycle, fan-out off, FrozenRemaining kept |
+| Cleanup | at `AlreadyPaidUntil = min(oldPaidThrough, quotaCycleEnd)`: delete the quantity 0 item, `proration_behavior=none`, retry for up to 24 hours | only when still FROZEN, still quantity 0, and no purchase is in progress |
+| Buy X again | there is no restore button; it is a purchase — before `AlreadyPaidUntil` the same item goes 0 → 1, with no double charge | before `AlreadyPaidUntil` → restore FrozenRemaining; from then on → new activation, reusing the quantity 0 item if it still exists; the quota anchor never moves |
 | Change term | native together with the base plan (X ACTIVE); Stripe restarts billing | quota anchor unchanged; keep Used, only add the positive delta |
 | Cancel plan | at period end, no proration | X ENDED together with the plan |
 
@@ -113,12 +113,12 @@ in the engine**. X Social does not use it: X's flow is hard-fixed by MODEL V6.
 
 - Money: Stripe prorates natively — there is no hand-written calculation for X.
 - Quota: [`quota-math.ts`](../backend/src/x-addon/quota-math.ts) — pure functions,
-  replays coverage from paid invoices, quota month stepped in whole months from the tenant's
+  replays coverage from paid invoices, quota cycle stepped in whole months from the tenant's
   quota anchor (`account.xAddon.quotaAnchor` = the base plan's billing anchor when X is first
-  bought, kept through interval changes), true-up for the last quota month of a yearly term
+  bought, kept through interval changes), true-up for the last quota cycle of a yearly term
   once the cycles run apart. [`x-addon.service.ts`](../backend/src/x-addon/x-addon.service.ts) — state,
   ledger, capacity, cancel / buy again / trial / quota deduction.
-- The quota month starts aligned with the billing month; a base-plan interval change restarts
+- The quota cycle starts aligned with the billing month; a base-plan interval change restarts
   Stripe's billing but not the quota cycle, so from then on the two run apart.
 - Reconcile runs **on every state read** and on receiving `invoice.paid`, so a missed
   webhook only delays the grant, never loses or duplicates it.
