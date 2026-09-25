@@ -5,24 +5,11 @@ export default function PolicyPanel({ run, busy, refreshToken }: any) {
   const [policy, setPolicy] = useState<any>(null);
   const [fields, setFields] = useState<any>(null);
   const [presets, setPresets] = useState<any[]>([]);
-  const [metered, setMetered] = useState<any[]>([]);
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
-
-  const loadMetered = () =>
-    api
-      .catalog()
-      .then((c: any) => {
-        const items = (c.addons ?? []).filter((a: any) => a.usagePriced);
-        setMetered(items);
-        setDrafts(Object.fromEntries(items.map((i: any) => [i.code, String(i.quotaAllowance ?? '')])));
-      })
-      .catch(() => setMetered([]));
 
   useEffect(() => {
     api.policy().then(setPolicy).catch(() => setPolicy(null));
     api.policyFields().then(setFields).catch(() => setFields(null));
     api.policyPresets().then(setPresets).catch(() => setPresets([]));
-    loadMetered();
   }, [refreshToken]);
 
   if (!policy || !fields) return <div className="empty">Loading policy…</div>;
@@ -97,56 +84,6 @@ export default function PolicyPanel({ run, busy, refreshToken }: any) {
           ))}
         </ul>
       </section>
-
-      {metered.length > 0 && (
-        <section className="card">
-          <h2>Metered allowances</h2>
-          <p className="hint">
-            How much each usage-priced add-on grants per month. This is the divisor in the credit sum — raising it
-            makes every unspent unit worth less, so it changes what customers are owed when they switch tier.
-            Nothing here touches Stripe.
-          </p>
-          <div className="settings">
-            {metered.map((item: any) => (
-              <div key={item.code}>
-                <label>
-                  {item.name}
-                  <span className="plan-note">
-                    {item.quotaLabel} · currently {item.quotaAllowance?.toLocaleString()}
-                  </span>
-                </label>
-                <div className="row">
-                  <input
-                    type="number"
-                    min={1}
-                    value={drafts[item.code] ?? ''}
-                    onChange={(e) => setDrafts({ ...drafts, [item.code]: e.target.value })}
-                  />
-                  <button
-                    className="ghost small"
-                    disabled={busy || Number(drafts[item.code]) === item.quotaAllowance || !drafts[item.code]}
-                    onClick={() =>
-                      run(
-                        () => api.updateCatalogItem(item.code, { quotaAllowance: Number(drafts[item.code]) }),
-                        `${item.name}: ${item.quotaLabel} set to ${Number(drafts[item.code]).toLocaleString()}`,
-                      ).then(loadMetered)
-                    }
-                  >
-                    Save
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-          <button
-            className="ghost small top-gap"
-            disabled={busy}
-            onClick={() => run(() => api.resetAllowances(), 'Allowances back to the built-in defaults').then(loadMetered)}
-          >
-            Reset to defaults
-          </button>
-        </section>
-      )}
 
       <section className="card">
         <h2>Change rules</h2>
@@ -423,39 +360,31 @@ export default function PolicyPanel({ run, busy, refreshToken }: any) {
               />
             </div>
             {/*
-              The provider budget is the only thing that can refuse a quantity
-              increase now that the per-plan ceiling is gone, so its dials belong
-              where every other rule is turned.
+              MODEL V6 row 17: every tenant admitted to the X add-on reserves
+              2,000 Post Updates before it is charged, against a commercial
+              ceiling kept below X's hard cap.
             */}
             <div>
-              <label>enforce provider capacity guard</label>
+              <label>enforce X capacity admission</label>
               <Toggle
                 value={policy.policy.constraints.enforceCapacityGuard}
                 onChange={(v: any) => patchSection('constraints', 'enforceCapacityGuard', v)}
               />
             </div>
             <div>
-              <label>refuse above (post updates / month)</label>
+              <label>X commercial ceiling (Post Updates)</label>
               <input
                 type="number"
-                value={policy.policy.constraints.capacityBlockAtUnits}
-                onChange={(e) => patchSection('constraints', 'capacityBlockAtUnits', Number(e.target.value))}
+                value={policy.policy.constraints.xCommercialCeilingUnits}
+                onChange={(e) => patchSection('constraints', 'xCommercialCeilingUnits', Number(e.target.value))}
               />
             </div>
             <div>
-              <label>warn above (post updates / month)</label>
+              <label>X provider hard cap (Post Updates)</label>
               <input
                 type="number"
-                value={policy.policy.constraints.capacityWarnAtUnits}
-                onChange={(e) => patchSection('constraints', 'capacityWarnAtUnits', Number(e.target.value))}
-              />
-            </div>
-            <div>
-              <label>each running trial commits</label>
-              <input
-                type="number"
-                value={policy.policy.constraints.trialCapacityUnits}
-                onChange={(e) => patchSection('constraints', 'trialCapacityUnits', Number(e.target.value))}
+                value={policy.policy.constraints.xProviderHardCapUnits}
+                onChange={(e) => patchSection('constraints', 'xProviderHardCapUnits', Number(e.target.value))}
               />
             </div>
           </div>

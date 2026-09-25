@@ -4,6 +4,42 @@ import { BillingTerm } from '../catalog/catalog.constants';
 
 export type AccountDocument = HydratedDocument<Account>;
 
+export interface XAddonAccountState {
+  /**
+   * Where the quota cycle is stepped from: the base plan's billing_cycle_anchor
+   * when X was activated, so its quota months start as the base plan's billing
+   * months. Kept through a base-plan interval change — Stripe's cycle restarts,
+   * this one does not, and the two run apart from then on. Reset only by a new
+   * activation, when the old quota has expired anyway.
+   */
+  quotaAnchor?: number;
+  /** when the add-on was cancelled, in the customer's clock */
+  cancelledAt?: number;
+  /** end of the quota month it was cancelled in — buying X again before this restores FrozenRemaining */
+  frozenUntil?: number;
+  cancelTerm?: BillingTerm;
+  /**
+   * MODEL V6 rows 49, 59: Cancel keeps the same Stripe item at quantity 0 until
+   * `min(oldPaidThrough, quotaMonthEnd)`, so buying X again before then can put
+   * it back to 1 without charging twice. Past it the item is cleaned up.
+   */
+  itemId?: string;
+  oldPaidThrough?: number;
+  alreadyPaidUntil?: number;
+  cleanupAt?: number;
+  /** cleanupAt + 24 hours: past this a cleanup that keeps failing is an alert */
+  cleanupDeadline?: number;
+  cleanedUpAt?: number;
+  cleanupError?: string;
+  cleanupAlert?: string;
+  cleanupAttempts?: number;
+  lastRepurchasedAt?: number;
+  /** last status reported, so a change of status is logged once */
+  lastStatus?: string;
+  quantityAlert?: string;
+  quantityAlertAt?: number;
+}
+
 @Schema({ _id: false })
 export class AddOnSelection {
   @Prop({ required: true }) code!: string;
@@ -86,45 +122,14 @@ export class Account {
   deactivated!: boolean;
 
   /**
-   * Simulated usage meter, keyed by add-on family: how much of this period's
-   * allowance has been spent. In production this number belongs to whatever
-   * service does the metering; here it is a knob, the same way the test clock
-   * is a knob for time.
+   * The one thing about the X add-on that Stripe cannot hold (MODEL V6): that
+   * the tenant cancelled it, until when the quota month it was cancelled in
+   * stays frozen, and until when its quantity-0 item is kept. Everything else
+   * — is the item there, at what quantity, is the time paid — is read back from
+   * Stripe on each reconcile, and the quota itself lives in `x_quota_ledgers`.
    */
   @Prop({ type: Object, default: {} })
-  usage!: Record<string, number>;
-
-  /**
-   * Which allowance month each meter reading belongs to, as the unix second
-   * that month started. A reading stamped with a month that has passed is
-   * spent: its leftovers are forfeited rather than carried over, so the meter
-   * reads zero again without anything having to fire on the boundary.
-   */
-  @Prop({ type: Object, default: {} })
-  usageCycleStart!: Record<string, number>;
-
-  /**
-   * The allowance actually granted for the month in progress, keyed by add-on
-   * family. It cannot be derived from the catalog any more: an add-on taken
-   * part-way through a month grants only the part that is left, so the cap a
-   * customer holds this month is a fact about the purchase rather than about
-   * the price book. Stamped with the month it belongs to; a stamp from a month
-   * that has passed means the next month starts whole again.
-   */
-  @Prop({ type: Object, default: {} })
-  quotaCap!: Record<string, number>;
-
-  @Prop({ type: Object, default: {} })
-  quotaCapCycleStart!: Record<string, number>;
-
-  /**
-   * What was actually invoiced for that family for the month in progress, in
-   * cents. MODEL V5 row 8 values a refund against what the customer really
-   * paid for this item this period, which after a mid-month purchase is not the
-   * list price — so the figure is recorded when it is charged.
-   */
-  @Prop({ type: Object, default: {} })
-  quotaInvoicedCents!: Record<string, number>;
+  xAddon!: XAddonAccountState;
 
   /** subscription items whose Stripe price is no longer in the catalog */
   @Prop({ type: [String], default: [] })

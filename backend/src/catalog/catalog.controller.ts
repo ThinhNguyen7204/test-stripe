@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { Controller, Get, Post } from '@nestjs/common';
 import { CatalogService } from './catalog.service';
 import { ANNUAL_DISCOUNT_PERCENT } from './catalog.constants';
 import { StripeService } from '../stripe/stripe.service';
@@ -25,15 +25,9 @@ export class CatalogController {
     return this.catalog.syncToStripe();
   }
 
-  /** Tune a catalog item at runtime. Only the allowance fields are editable. */
-  @Patch(':code')
-  update(@Param('code') code: string, @Body() body: { quotaAllowance?: number; quotaLabel?: string }) {
-    return this.catalog.updateItem(code, body ?? {});
-  }
-
   @Post('reseed')
-  async reseed(@Query('force') force?: string) {
-    await this.catalog.seedLocal(force === 'true');
-    return { ok: true, allowancesReset: force === 'true' };
+  async reseed() {
+    await this.catalog.seedLocal();
+    return { ok: true };
   }
 }

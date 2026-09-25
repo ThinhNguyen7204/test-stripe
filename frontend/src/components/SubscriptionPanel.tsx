@@ -9,17 +9,7 @@ export default function SubscriptionPanel({ accountId, catalog, state, run, busy
   const [overrides, setOverrides] = useState<any>({});
   // null = follow the billing policy, true/false = the operator decided
   const [trialChoice, setTrialChoice] = useState<boolean | null>(null);
-  // how much of a metered add-on's allowance is spent; the billing engine needs
-  // it to price the unused part when switching tiers, so it is editable right
-  // here rather than only on the sidebar meter
-  const [usedDraft, setUsedDraft] = useState<Record<string, string>>({});
   const currency = catalog?.currency ?? 'usd';
-
-  const storedUsage = JSON.stringify(state?.account?.usage ?? {});
-  useEffect(() => {
-    const usage = state?.account?.usage ?? {};
-    setUsedDraft(Object.fromEntries(Object.keys(usage).map((f) => [f, String(usage[f] ?? 0)])));
-  }, [storedUsage]);
 
   // Reset the draft whenever the live subscription changes.
   useEffect(() => {
@@ -91,18 +81,11 @@ export default function SubscriptionPanel({ accountId, catalog, state, run, busy
 
   const plans = catalog.plans ?? [];
   const addons = catalog.addons ?? [];
-  // tiered add-ons are picked one tier at a time, per-unit ones get a stepper
-  const perUnitAddons = addons.filter((a: any) => !a.family);
-  const tieredFamilies = Object.values(
-    addons
-      .filter((a: any) => a.family)
-      .reduce((acc: any, a: any) => {
-        acc[a.family] = acc[a.family] ?? { family: a.family, tiers: [] };
-        acc[a.family].tiers.push(a);
-        acc[a.family].tiers.sort((x: any, y: any) => x.tierRank - y.tierRank);
-        return acc;
-      }, {}),
-  );
+  // the X add-on is a single on/off line with quantity fixed at 1 (MODEL V6 row 4)
+  const xAddon = addons.find((a: any) => a.code === 'x_social');
+  const perUnitAddons = addons.filter((a: any) => a.code !== 'x_social');
+  const xOn = Number(draft.addOns?.x_social ?? 0) > 0;
+  const xStatus = state.xAddon?.status ?? 'NONE';
   const activePlan = plans.find((p: any) => p.code === draft.planCode);
   const perScreen = draft.term === 'yearly' ? activePlan?.annualMonthlyCents : activePlan?.monthlyCents;
 
@@ -185,137 +168,39 @@ export default function SubscriptionPanel({ accountId, catalog, state, run, busy
           </div>
         </div>
 
-        <div className="field">
-          <label>Metered add-ons</label>
-          {tieredFamilies.map(({ family, tiers }: any) => {
-            const activeCode = tiers.find((t: any) => Number(draft.addOns?.[t.code] ?? 0) > 0)?.code ?? null;
-            const qty = activeCode ? Number(draft.addOns?.[activeCode] ?? 0) : 0;
-            const setQty = (n: number) =>
-              activeCode &&
-              setDraft({ ...draft, addOns: { ...draft.addOns, [activeCode]: Math.max(1, n) } });
-            const liveCode = (state.current.addOns ?? []).find((a: any) =>
-              tiers.some((t: any) => t.code === a.code),
-            )?.code ?? null;
-            const liveTier = tiers.find((t: any) => t.code === liveCode);
-            const switching = Boolean(liveCode && activeCode && liveCode !== activeCode);
-            const termSwitching = Boolean(liveCode && activeCode && draft.term !== state.current.term);
-            return (
-              <div className="tiered" key={family}>
-                <div className="segmented">
-                  <button
-                    className={activeCode === null ? 'seg active' : 'seg'}
-                    onClick={() =>
-                      setDraft({
-                        ...draft,
-                        addOns: Object.fromEntries(
-                          Object.entries(draft.addOns ?? {}).filter(([c]) => !tiers.some((t: any) => t.code === c)),
-                        ),
-                      })
-                    }
-                  >
-                    Off
-                  </button>
-                  {tiers.map((t: any) => (
-                    <button
-                      key={t.code}
-                      className={activeCode === t.code ? 'seg active' : 'seg'}
-                      onClick={() =>
-                        setDraft({
-                          ...draft,
-                          addOns: {
-                            ...Object.fromEntries(
-                              Object.entries(draft.addOns ?? {}).filter(([c]) => !tiers.some((x: any) => x.code === c)),
-                            ),
-                            // a tier switch reprices the licences held, it does not reset them
-                            [t.code]: Math.max(1, qty),
-                          },
-                        })
-                      }
-                    >
-                      {t.name.replace(/^X Social /, '')}
-                    </button>
-                  ))}
-                </div>
-                {activeCode && (
-                  <div className="addon-row">
-                    <span className="mini">licences</span>
-                    <button className="ghost small" disabled={qty <= 1} onClick={() => setQty(qty - 1)}>
-                      −
-                    </button>
-                    <input
-                      type="number"
-                      min={1}
-                      value={qty}
-                      onChange={(e) => setQty(Math.floor(Number(e.target.value) || 1))}
-                    />
-                    <button className="ghost small" onClick={() => setQty(qty + 1)}>
-                      +
-                    </button>
-                    <span className="mini">
-                      × {(tiers.find((t: any) => t.code === activeCode)?.quotaAllowance ?? 0).toLocaleString()} ={' '}
-                      {(
-                        (tiers.find((t: any) => t.code === activeCode)?.quotaAllowance ?? 0) * qty
-                      ).toLocaleString()}{' '}
-                      {tiers.find((t: any) => t.code === activeCode)?.quotaLabel ?? ''} / month
-                    </span>
-                  </div>
-                )}
-                <div className="plan-note">
-                  {tiers
-                    .map(
-                      (t: any) =>
-                        `${t.name.replace(/^X Social /, '')} ${money(
-                          draft.term === 'yearly' ? t.annualMonthlyCents : t.monthlyCents,
-                          currency,
-                        )}/mo · ${t.quotaAllowance?.toLocaleString()} ${t.quotaLabel ?? ''}`,
-                    )
-                    .join(' — ')}
-                </div>
-                {liveCode && (
-                  <div className="quota-box">
-                    <span className="mini">
-                      {liveTier?.quotaLabel ?? 'allowance'} spent on {liveTier?.name}
-                    </span>
-                    <span className="quota-edit">
-                      <input
-                        type="number"
-                        min={0}
-                        max={state.usageCycle?.[family]?.allowance ?? liveTier?.quotaAllowance}
-                        value={usedDraft[family] ?? String(state.usageCycle?.[family]?.used ?? state.account.usage?.[family] ?? 0)}
-                        onChange={(e) => setUsedDraft({ ...usedDraft, [family]: e.target.value })}
-                      />
-                      <span className="mini">
-                        / {(state.usageCycle?.[family]?.allowance ?? liveTier?.quotaAllowance ?? 0).toLocaleString()}
-                      </span>
-                      <button
-                        className="ghost small"
-                        disabled={(() => {
-                          const live = state.usageCycle?.[family]?.used ?? state.account.usage?.[family] ?? 0;
-                          return busy || usedDraft[family] === '' || Number(usedDraft[family] ?? live) === live;
-                        })()}
-                        onClick={() =>
-                          run(
-                            () => api.setUsage(accountId, family, Number(usedDraft[family])),
-                            `${liveTier?.quotaLabel}: ${Number(usedDraft[family]).toLocaleString()} spent`,
-                          )
-                        }
-                      >
-                        Save
-                      </button>
-                    </span>
-                    <span className="plan-note">
-                      {switching || termSwitching
-                        ? 'whatever is left becomes account credit'
-                        : state.usageCycle?.[family]?.monthsInPeriod > 1
-                          ? `month ${state.usageCycle[family].index + 1} of ${state.usageCycle[family].monthsInPeriod} — type how many posts went out, then Save`
-                          : 'type how many posts went out, then Save'}
-                    </span>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
+        {xAddon && (
+          <div className="field">
+            <label>X Social add-on</label>
+            <div className="segmented">
+              {[false, true].map((on) => (
+                <button
+                  key={String(on)}
+                  className={xOn === on ? 'seg active' : 'seg'}
+                  onClick={() => {
+                    const next = { ...(draft.addOns ?? {}) };
+                    if (on) next.x_social = 1;
+                    else delete next.x_social;
+                    setDraft({ ...draft, addOns: next });
+                  }}
+                >
+                  {on ? 'On' : 'Off'}
+                </button>
+              ))}
+            </div>
+            <div className="plan-note">
+              {money(xAddon.monthlyCents, currency)} / month or {money(xAddon.annualMonthlyCents * 12, currency)} / year ·
+              one per account, quantity fixed at 1 · 2,000 Post Updates per quota month, granted by paid time
+            </div>
+            {(xStatus === 'FROZEN' || xStatus === 'CANCELED') && (
+              <p className="hint">
+                {xStatus === 'FROZEN'
+                  ? `Cancelled — frozen until ${day(state.xAddon.frozen?.until)}. Turning it on buys X again and restores the frozen Remaining, which still expires then.`
+                  : 'Cancelled and its quota month is over — turning it on buys X again as a new activation.'}
+              </p>
+            )}
+            <p className="hint">Add or cancel it on its own: it has its own proration boundary and paid gate.</p>
+          </div>
+        )}
 
         <div className="field">
           <label>Per-unit add-ons</label>
@@ -472,79 +357,46 @@ export default function SubscriptionPanel({ accountId, catalog, state, run, busy
               </div>
 
               {/*
-                Committed provider capacity is a platform-wide figure, so nothing
-                on this account shows how close a change is to the ceiling. A
-                refusal would otherwise arrive with no warning at all.
+                X capacity is a platform-wide figure, so nothing on this
+                account shows how close a purchase is to the ceiling. A refusal
+                would otherwise arrive with no warning at all.
               */}
               {preview.capacity && (
                 <div className="rule-box">
-                  <span className={`pill ${preview.capacity.blocked ? 'warn' : preview.capacity.warning ? 'warn' : 'ok'}`}>
-                    provider capacity
-                  </span>
+                  <span className={`pill ${preview.capacity.admitsOneMore ? 'ok' : 'warn'}`}>X capacity</span>
                   <ul>
                     <li>
-                      After this change: <strong>{preview.capacity.projected.toLocaleString()}</strong> post
-                      updates a month committed across the platform
-                      {preview.capacity.projected !== preview.capacity.before && (
-                        <> (now {preview.capacity.before.toLocaleString()})</>
-                      )}
-                      .
+                      {preview.capacity.committed.toLocaleString()} committed + {preview.capacity.pending.toLocaleString()}{' '}
+                      pending of a {preview.capacity.ceiling.toLocaleString()} commercial ceiling (
+                      {preview.capacity.hardCap.toLocaleString()} hard cap, {preview.capacity.buffer.toLocaleString()} buffer).
                     </li>
-                    {preview.capacity.blocked && <li className="error-text">{preview.capacity.blocked}</li>}
-                    {preview.capacity.warning && <li>{preview.capacity.warning}</li>}
+                    {!preview.capacity.admitsOneMore && (
+                      <li className="error-text">No room for another 2,000 — this purchase would be refused.</li>
+                    )}
                   </ul>
                 </div>
               )}
 
-              {!preview.invoice && preview.previewUnavailable && (
-                <p className="hint">{preview.previewUnavailable}</p>
-              )}
-
-              {preview.mode === 'usage_settlement' && preview.breakdown && (
+              {preview.quota && (
                 <table className="lines">
                   <tbody>
-                    {preview.breakdown.creditCents > 0 && (
-                      <tr>
-                        <td>
-                          Unspent {preview.quota?.label ?? 'allowance'} returned
-                          <div className="period">
-                            {preview.quota?.unused} of {preview.quota?.allowance} · {preview.breakdown.creditFormula}
-                          </div>
-                        </td>
-                        <td className="right credit">−{money(preview.breakdown.creditCents, currency)}</td>
-                      </tr>
-                    )}
                     <tr>
                       <td>
-                        {/*
-                          The new configuration is sold by the slice of the month
-                          that is left, not at full price — saying otherwise
-                          contradicts the formula printed directly underneath.
-                        */}
-                        {preview.breakdown.remainingFraction !== undefined &&
-                        preview.breakdown.remainingFraction < 0.999
-                          ? 'New configuration, priced for the rest of the month'
-                          : 'New configuration, a whole allowance month'}
-                        <div className="period">{preview.breakdown.chargeFormula}</div>
+                        Quota month {day(preview.quota.quotaMonth?.start)} → {day(preview.quota.quotaMonth?.end)}
+                        {preview.quota.formula && <div className="period">{preview.quota.formula}</div>}
                       </td>
-                      <td className="right">{money(preview.breakdown.chargeCents, currency)}</td>
+                      <td className="right">
+                        {preview.mode === 'x_cancel'
+                          ? `frozen at ${preview.quota.granted} / used ${preview.quota.used}`
+                          : `+${preview.quota.delta} → ${preview.quota.target}`}
+                      </td>
                     </tr>
-                    {preview.breakdown.existingCreditCents > 0 && (
-                      <tr>
-                        <td>Credit already on the account</td>
-                        <td className="right credit">
-                          −{money(preview.breakdown.existingCreditCents, currency)}
-                        </td>
-                      </tr>
-                    )}
                   </tbody>
-                  <tfoot>
-                    <tr className="grand">
-                      <td>Charged to the card now</td>
-                      <td className="right">{money(preview.breakdown.dueNowCents, currency)}</td>
-                    </tr>
-                  </tfoot>
                 </table>
+              )}
+
+              {!preview.invoice && preview.previewUnavailable && (
+                <p className="hint">{preview.previewUnavailable}</p>
               )}
 
               {preview.mode === 'schedule' && (

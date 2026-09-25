@@ -27,12 +27,8 @@ export class CatalogService implements OnModuleInit {
 
   /**
    * Writes the OptiSigns price book into Mongo (no Stripe calls).
-   *
-   * The allowance fields are seeded with `$setOnInsert` rather than `$set`:
-   * they are meant to be tuned at runtime, and a restart must not quietly undo
-   * that. `reseed(force)` is how you deliberately go back to the defaults.
    */
-  async seedLocal(force = false): Promise<void> {
+  async seedLocal(): Promise<void> {
     for (const def of CATALOG) {
       const structural = {
         kind: def.kind,
@@ -45,12 +41,11 @@ export class CatalogService implements OnModuleInit {
         minQuantity: def.minQuantity,
         maxQuantity: def.maxQuantity,
         boundToScreens: Boolean(def.boundToScreens),
-        family: def.family,
         perAccount: Boolean(def.perAccount),
-        usagePriced: Boolean(def.usagePriced),
+        quotaAllowance: def.quotaAllowance,
+        quotaLabel: def.quotaLabel,
         features: def.features,
       };
-      const tunable = { quotaAllowance: def.quotaAllowance, quotaLabel: def.quotaLabel };
 
       /*
        * A structural field that the price book no longer sets has to be removed,
@@ -69,43 +64,14 @@ export class CatalogService implements OnModuleInit {
       await this.model.updateOne(
         { code: def.code },
         {
-          ...(force ? { $set: { ...set, ...tunable } } : { $set: set, $setOnInsert: tunable }),
+          $set: set,
           ...(Object.keys(unset).length ? { $unset: unset } : {}),
         },
         { upsert: true },
       );
     }
     await this.pruneStaleItems();
-    this.logger.log(`Catalog ready: ${CATALOG.length} items${force ? ' (allowances reset to defaults)' : ''}`);
-  }
-
-  /** Runtime-tunable fields on a catalog item. Prices are not among them. */
-  async updateItem(code: string, patch: { quotaAllowance?: number; quotaLabel?: string }) {
-    const item = await this.get(code);
-    const set: Record<string, any> = {};
-
-    if (patch.quotaAllowance !== undefined) {
-      if (!item.usagePriced) {
-        throw new BadRequestException(`"${code}" is not priced by usage, so it has no allowance to set.`);
-      }
-      const value = Math.floor(Number(patch.quotaAllowance));
-      if (!Number.isFinite(value) || value < 1) {
-        throw new BadRequestException('The allowance must be a whole number of at least 1.');
-      }
-      set.quotaAllowance = value;
-    }
-    if (patch.quotaLabel !== undefined) {
-      const label = String(patch.quotaLabel).trim();
-      if (!label) throw new BadRequestException('The allowance needs a name.');
-      set.quotaLabel = label;
-    }
-    if (Object.keys(set).length === 0) {
-      throw new BadRequestException('Nothing to change. Send quotaAllowance and/or quotaLabel.');
-    }
-
-    await this.model.updateOne({ code }, { $set: set });
-    this.logger.log(`Catalog item "${code}" updated: ${JSON.stringify(set)}`);
-    return this.get(code);
+    this.logger.log(`Catalog ready: ${CATALOG.length} items`);
   }
 
   /**

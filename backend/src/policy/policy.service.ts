@@ -65,15 +65,25 @@ export class PolicyService implements OnModuleInit {
     if (policy.constraints && policy.constraints.addOnsRequirePaidPlan === undefined) {
       policy.constraints.addOnsRequirePaidPlan = true;
     }
-    // documents written before tiered add-ons existed
-    if (!policy.addOnRules) policy.addOnRules = OPTISIGNS_DEFAULT.addOnRules;
-    if (!policy.rules?.addOnTierChange) {
-      policy.rules = { ...policy.rules, addOnTierChange: OPTISIGNS_DEFAULT.rules.addOnTierChange };
+    if (!policy.addOnRules) policy.addOnRules = {};
+    /*
+     * Documents written under MODEL V5: the tier-change rule and the metered
+     * x_social override no longer exist (V6 row 48), and the capacity guard is
+     * measured in reservations against a 2.5M commercial ceiling now.
+     */
+    const rules: any = policy.rules ?? {};
+    delete rules.addOnTierChange;
+    delete (policy.addOnRules as any).x_social;
+    const constraints: any = policy.constraints ?? {};
+    if (constraints.xCommercialCeilingUnits === undefined) {
+      constraints.xCommercialCeilingUnits = OPTISIGNS_DEFAULT.constraints.xCommercialCeilingUnits;
     }
-    // documents written while a settlement always raised its own invoice
-    if (policy.invoicing && policy.invoicing.combineUsageSettlementInvoice === undefined) {
-      policy.invoicing.combineUsageSettlementInvoice = true;
+    if (constraints.xProviderHardCapUnits === undefined) {
+      constraints.xProviderHardCapUnits = OPTISIGNS_DEFAULT.constraints.xProviderHardCapUnits;
     }
+    delete constraints.capacityWarnAtUnits;
+    delete constraints.capacityBlockAtUnits;
+    delete constraints.trialCapacityUnits;
     return policy;
   }
 
@@ -129,26 +139,6 @@ export class PolicyService implements OnModuleInit {
     }
 
     for (const [key, rule] of Object.entries(policy.rules ?? {})) {
-      /*
-       * A quota-measured rule prices and collects the change itself, so every
-       * check below — which all assume Stripe is doing the arithmetic — would
-       * be wrong about it. Its own requirement is the opposite: Stripe must
-       * stay out of the calculation entirely.
-       */
-      if (rule.creditBasis === 'quota') {
-        if (rule.prorationBehavior !== 'none') {
-          /*
-           * The engine forces "none" on a usage-priced line whatever this says,
-           * because letting Stripe price it too would bill the customer twice.
-           * So the setting is not dangerous — it is just a lie on the screen.
-           */
-          warnings.push(
-            `${key}: proration_behavior="${rule.prorationBehavior}" is ignored — a usage-priced line is always applied with "none" so Stripe cannot bill for the same period twice. Set it to "none" so the screen matches what happens.`,
-          );
-        }
-        continue;
-      }
-
       if (rule.prorationBehavior === 'none' && rule.creditHandling === 'block') {
         warnings.push(
           `${key}: creditHandling="block" never triggers because proration_behavior is "none" — the change is always free, so nothing is ever owed back.`,
@@ -189,17 +179,17 @@ export class PolicyService implements OnModuleInit {
 
   /**
    * Effective rule, layered: global rule → per-add-on override → per-request
-   * override. The middle layer is what lets a metered add-on behave differently
-   * without a second engine.
+   * override. The middle layer lets one add-on behave differently without a
+   * second engine.
    */
-  async resolveRule(key: ChangeRuleKey, override?: RuleOverride, family?: string): Promise<ChangeRule> {
+  async resolveRule(key: ChangeRuleKey, override?: RuleOverride, addOnCode?: string): Promise<ChangeRule> {
     const policy = await this.get();
     const rule = policy.rules?.[key] ?? OPTISIGNS_DEFAULT.rules[key];
 
     let itemRule: Partial<ChangeRule> = {};
-    if (family) {
-      const kind = key === 'addOnIncrease' ? 'add' : key === 'addOnDecrease' ? 'remove' : key === 'addOnTierChange' ? 'tierChange' : null;
-      if (kind) itemRule = policy.addOnRules?.[family]?.[kind] ?? {};
+    if (addOnCode) {
+      const kind = key === 'addOnIncrease' ? 'add' : key === 'addOnDecrease' ? 'remove' : null;
+      if (kind) itemRule = policy.addOnRules?.[addOnCode]?.[kind] ?? {};
     }
 
     return { ...rule, ...itemRule, ...(override ?? {}) };

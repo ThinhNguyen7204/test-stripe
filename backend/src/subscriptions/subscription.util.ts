@@ -5,6 +5,7 @@ import { BillingTerm } from '../catalog/catalog.constants';
 import { ChangeRuleKey } from '../policy/policy.types';
 import { ConstraintPolicy } from '../policy/policy.types';
 import { AddOnRequest, ChangeClassification, DesiredState } from './subscription.types';
+import { X_ADDON_CODE } from '../x-addon/quota-math';
 
 export const FREE = 'free';
 
@@ -37,11 +38,6 @@ export function addOnMonthlyValue(
     const def = addOnItems.get(a.code);
     return def ? sum + perUnitMonthlyCents(def, term) * a.quantity : sum;
   }, 0);
-}
-
-/** Which family an add-on belongs to, if any. Falls back to its own code. */
-export function familyOf(code: string, addOnItems: Map<string, CatalogItemDocument>): string | undefined {
-  return addOnItems.get(code)?.family;
 }
 
 export function normaliseAddOns(addOns: AddOnRequest[] | undefined): AddOnRequest[] {
@@ -90,51 +86,12 @@ export function classifyChange(args: {
     if (before !== after) changes.push(`add-on ${code} ${before} → ${after}`);
   }
 
-  /*
-   * A tiered add-on never has two tiers held at once, so a family that appears
-   * in both states under different codes is a tier switch — a single rule for
-   * both directions, not an add plus a remove.
-   */
-  let tierSwitch: { family: string; fromCode: string; toCode: string } | null = null;
-  for (const [code] of desiredAddOns) {
-    const family = addOnItems.get(code)?.family;
-    if (!family || currentAddOns.has(code)) continue;
-    const sibling = [...currentAddOns.keys()].find(
-      (c) => c !== code && addOnItems.get(c)?.family === family,
-    );
-    if (sibling) tierSwitch = { family, fromCode: sibling, toCode: code };
-  }
-
-  /*
-   * A usage-priced family whose quantity was *cut* gives allowance back, which
-   * only the tier-change flow knows how to value (row 8 credits on allowance
-   * rather than on days). Buying more is not that: it adds licences without
-   * disturbing the ones already sold, so it stays an ordinary add-on increase.
-   */
-  let quantityOnlyUsageChange: { family: string; fromCode: string; toCode: string } | null = null;
-  for (const [code, after] of desiredAddOns) {
-    const def = addOnItems.get(code);
-    if (!def?.usagePriced || !def.family) continue;
-    const before = currentAddOns.get(code) ?? 0;
-    /*
-     * Only a *reduction* is a reconfiguration: it gives quota back, so it runs
-     * the replace-everything flow. Buying more is additive — the licences
-     * already held keep what they were sold — and is an ordinary add-on
-     * increase.
-     */
-    if (before > 0 && after < before) {
-      quantityOnlyUsageChange = { family: def.family, fromCode: code, toCode: code };
-    }
-  }
-
   let ruleKey: ChangeRuleKey | null = null;
   if (current.term !== desired.term) {
     ruleKey = desired.term === 'yearly' ? 'termToYearly' : 'termToMonthly';
   } else if (current.planCode !== desired.planCode) {
     const currentRank = currentPlan?.tierRank ?? 0;
     ruleKey = desiredPlan.tierRank >= currentRank ? 'planUpgrade' : 'planDowngrade';
-  } else if (tierSwitch || quantityOnlyUsageChange) {
-    ruleKey = 'addOnTierChange';
   } else if (current.screens !== desired.screens) {
     ruleKey = desired.screens > current.screens ? 'screensIncrease' : 'screensDecrease';
   } else if (changes.length > 0) {
@@ -153,17 +110,13 @@ export function classifyChange(args: {
     currentTerm: current.term,
     monthlyValueBefore,
     monthlyValueAfter,
-    tierSwitch,
-    /** the add-on family this change concerns, for per-add-on rule overrides */
-    family:
-      tierSwitch?.family ??
-      quantityOnlyUsageChange?.family ??
-      (ruleKey === 'addOnIncrease' || ruleKey === 'addOnDecrease'
-        ? [...new Set([...currentAddOns.keys(), ...desiredAddOns.keys()])]
-            .filter((c) => (currentAddOns.get(c) ?? 0) !== (desiredAddOns.get(c) ?? 0))
-            .map((c) => addOnItems.get(c)?.family)
-            .find(Boolean)
-        : undefined),
+    /** the add-on this change concerns, for per-add-on rule overrides */
+    addOnCode:
+      ruleKey === 'addOnIncrease' || ruleKey === 'addOnDecrease'
+        ? [...new Set([...currentAddOns.keys(), ...desiredAddOns.keys()])].find(
+            (c) => (currentAddOns.get(c) ?? 0) !== (desiredAddOns.get(c) ?? 0),
+          )
+        : undefined,
   };
 }
 
@@ -208,27 +161,16 @@ export function validateDesiredState(args: {
     );
   }
 
-  const seenFamilies = new Map<string, string>();
   for (const addOn of desired.addOns) {
     const def = addOnItems.get(addOn.code);
     if (!def) throw new BadRequestException(`Unknown add-on "${addOn.code}"`);
 
-    // Two tiers of the same add-on can never be held together.
-    if (def.family) {
-      const already = seenFamilies.get(def.family);
-      if (already && already !== addOn.code) {
-        throw new BadRequestException(
-          `${def.name} and ${addOnItems.get(already)?.name} are tiers of the same add-on — pick one, not both`,
-        );
-      }
-      seenFamilies.set(def.family, addOn.code);
+    // MODEL V6 row 4 / EASY 5: one X add-on per tenant, quantity exactly 1.
+    if (addOn.code === X_ADDON_CODE && addOn.quantity !== 1) {
+      throw new BadRequestException(
+        `The X add-on is sold one per account with quantity fixed at 1 — ${addOn.quantity} was requested. There is no quantity 2 or 3 in MODEL V6.`,
+      );
     }
-    /*
-     * Being licensed per account says where the add-on attaches, not how many
-     * of it may be held: quantity is the customer's to choose and has no
-     * per-plan ceiling (MODEL V5 row 4). An add-on that really is single-seat
-     * still says so through maxQuantity, which is checked next.
-     */
     if (def.maxQuantity && addOn.quantity > def.maxQuantity) {
       throw new BadRequestException(`${def.name} allows at most ${def.maxQuantity}`);
     }

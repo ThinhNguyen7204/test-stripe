@@ -21,10 +21,6 @@ export const POLICY_FIELD_OPTIONS = {
     { value: 'error_if_incomplete', label: 'error_if_incomplete — reject the change if payment fails' },
     { value: 'pending_if_incomplete', label: 'pending_if_incomplete — park the update until paid' },
   ],
-  creditBasis: [
-    { value: 'time', label: 'time — value left in the days remaining (Stripe computes it)' },
-    { value: 'quota', label: 'quota — value left in the unused allowance (the app computes it)' },
-  ],
   creditHandling: [
     { value: 'customer_balance', label: 'customer_balance — leave it where Stripe put it' },
     { value: 'push_to_account_balance', label: 'push_to_account_balance — always visible as account credit' },
@@ -91,7 +87,6 @@ export const CHANGE_RULE_LABELS: Record<string, string> = {
   planDowngrade: 'Downgrade plan tier',
   addOnIncrease: 'Add / increase an add-on',
   addOnDecrease: 'Remove / decrease an add-on',
-  addOnTierChange: 'Switch tier of a metered add-on',
   termToYearly: 'Switch monthly → yearly',
   termToMonthly: 'Switch yearly → monthly',
 };

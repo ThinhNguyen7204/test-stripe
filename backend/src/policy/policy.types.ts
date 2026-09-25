@@ -44,16 +44,6 @@ export type CreditHandling =
   | 'block'
   | 'none';
 
-/**
- * What "unused" means when working out how much the customer is owed.
- *
- * time  — the usual: value left in the days remaining, Stripe computes it.
- * quota — for metered add-ons: value left in the allowance not yet consumed.
- *         Stripe cannot know this, so the app computes it and Stripe's own
- *         proration is switched off for that change.
- */
-export type CreditBasis = 'time' | 'quota';
-
 export type ChangeRuleKey =
   | 'screensIncrease'
   | 'screensDecrease'
@@ -61,7 +51,6 @@ export type ChangeRuleKey =
   | 'planDowngrade'
   | 'addOnIncrease'
   | 'addOnDecrease'
-  | 'addOnTierChange'
   | 'termToYearly'
   | 'termToMonthly';
 
@@ -72,7 +61,6 @@ export const CHANGE_RULE_KEYS: ChangeRuleKey[] = [
   'planDowngrade',
   'addOnIncrease',
   'addOnDecrease',
-  'addOnTierChange',
   'termToYearly',
   'termToMonthly',
 ];
@@ -87,20 +75,18 @@ export interface ChangeRule {
   paymentBehavior: PaymentBehavior;
   /** only consulted when the change produces a negative (credit) amount */
   creditHandling: CreditHandling;
-  /** how the amount owed back is measured; defaults to 'time' */
-  creditBasis?: CreditBasis;
   notes?: string;
 }
 
 /**
- * Per-add-on overrides, keyed by the add-on's family (or its code when it has
- * no family). They layer on top of the global rules, so a metered add-on can
- * behave differently from the per-unit ones without forking the engine.
+ * Per-add-on overrides, keyed by the add-on's code. They layer on top of the
+ * global rules, so one add-on can behave differently from the others without
+ * forking the engine. (The X add-on does not use them: MODEL V6 fixes its
+ * purchase, cancel and buy-again flows, see x-addon/x-addon.service.ts.)
  */
 export interface AddOnRuleSet {
   add?: Partial<ChangeRule>;
   remove?: Partial<ChangeRule>;
-  tierChange?: Partial<ChangeRule>;
 }
 
 export interface CancellationPolicy {
@@ -144,17 +130,6 @@ export interface InvoicingPolicy {
   defaultPaymentBehavior: PaymentBehavior;
   /** align every renewal to the 1st of the month (Stripe billing_cycle_anchor_config) */
   anchorToFirstOfMonth: boolean;
-  /**
-   * Whether a usage-priced settlement shares the invoice that the subscription
-   * change raises. One operation then reads as one invoice and the card is
-   * charged once.
-   *
-   * It only applies when the accompanying change raises an invoice at all: a
-   * tier switch that carries `proration_behavior: 'none'` raises none, so the
-   * settlement keeps its own invoice rather than sitting unbilled until the
-   * next renewal.
-   */
-  combineUsageSettlementInvoice: boolean;
 }
 
 export interface RefundPolicy {
@@ -180,21 +155,21 @@ export interface ConstraintPolicy {
   /** allow reducing screens to 0 as a "seasonal pause" */
   allowZeroScreens: boolean;
   /**
-   * Admission control on the upstream provider budget (MODEL V5 row 17). The
-   * committed capacity is what has been sold — every usage-priced licence held,
-   * times its monthly allowance, plus a nominal charge per running trial —
-   * rather than what has been spent.
-   *
-   * Anything that would *raise* it is refused once the projection passes
-   * `capacityBlockAtUnits`: a first purchase, a quantity increase, a move to a
-   * bigger tier, a new trial. Reductions are always allowed, because they only
-   * give capacity back (MODEL V5 row 63).
+   * X admission control, MODEL V6 row 17. Every tenant admitted to the X
+   * add-on reserves one full quota month (2,000 Post Updates) before it is
+   * charged; a purchase, including buying X again, is refused when
+   * `CommercialCommitted + PendingReservations + 2,000 > xCommercialCeilingUnits`.
+   * The gap up to `xProviderHardCapUnits` is the operational buffer that is
+   * never sold. An interval change reserves nothing more.
    */
   enforceCapacityGuard: boolean;
-  capacityWarnAtUnits: number;
-  capacityBlockAtUnits: number;
-  /** what one running trial commits, before it has any licence of its own */
-  trialCapacityUnits: number;
+  xCommercialCeilingUnits: number;
+  xProviderHardCapUnits: number;
+  /**
+   * Test switch: make the boundary cleanup of a quantity-0 X item fail, so the
+   * 24-hour retry and the reuse of a still-present item can be exercised.
+   */
+  xCleanupPaused?: boolean;
 }
 
 export interface DunningPolicy {
@@ -206,7 +181,7 @@ export interface DunningPolicy {
 
 export interface BillingPolicyShape {
   rules: Record<ChangeRuleKey, ChangeRule>;
-  /** overrides for one add-on family, e.g. the metered X Social add-on */
+  /** overrides for one add-on, keyed by its code */
   addOnRules: Record<string, AddOnRuleSet>;
   cancellation: CancellationPolicy;
   trial: TrialPolicy;

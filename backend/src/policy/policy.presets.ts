@@ -64,16 +64,6 @@ export const OPTISIGNS_DEFAULT: BillingPolicyShape = {
       creditHandling: 'push_to_account_balance',
       notes: 'Removing an add-on hands back visible Stripe account credit.',
     }),
-    addOnTierChange: rule({
-      timing: 'immediate',
-      prorationBehavior: 'none',
-      billingCycleAnchor: 'unchanged',
-      paymentBehavior: 'error_if_incomplete',
-      creditHandling: 'customer_balance',
-      creditBasis: 'quota',
-      notes:
-        'Moving between tiers of a metered add-on: the unused allowance of the old tier is converted to Stripe account credit, and the new tier is billed for the days remaining. Stripe proration is off because it cannot see the allowance.',
-    }),
     termToYearly: rule({
       timing: 'immediate',
       prorationBehavior: 'always_invoice',
@@ -92,22 +82,7 @@ export const OPTISIGNS_DEFAULT: BillingPolicyShape = {
         'Dropping to monthly takes effect today: the cycle restarts, the first monthly period is invoiced and the unused part of the paid year becomes Stripe account credit. No money leaves Stripe.',
     }),
   },
-  addOnRules: {
-    /*
-     * X Social is metered, so it does not follow the per-unit add-on rules:
-     * cancelling keeps the allowance to the end of the paid period and hands
-     * nothing back (MODEL V5, STT 49).
-     */
-    x_social: {
-      remove: {
-        timing: 'end_of_period',
-        prorationBehavior: 'none',
-        paymentBehavior: 'allow_incomplete',
-        creditHandling: 'none',
-        notes: 'Cancelling keeps the allowance until the renewal boundary, then the add-on ends. No money back.',
-      },
-    },
-  },
+  addOnRules: {},
   cancellation: {
     timing: 'at_period_end',
     prorateUnusedTime: false,
@@ -128,9 +103,6 @@ export const OPTISIGNS_DEFAULT: BillingPolicyShape = {
     automaticTax: false,
     defaultPaymentBehavior: 'error_if_incomplete',
     anchorToFirstOfMonth: false,
-    // one operation, one invoice: the allowance charge rides along with the
-    // invoice the subscription change already raises
-    combineUsageSettlementInvoice: true,
   },
   refunds: {
     windowDays: 30,
@@ -145,11 +117,10 @@ export const OPTISIGNS_DEFAULT: BillingPolicyShape = {
     addOnCannotExceedScreens: true,
     freePlanScreenCap: 3,
     allowZeroScreens: true,
-    // MODEL V5 row 17: warn at 70% of the provider budget, refuse at 80%.
+    // MODEL V6 row 17: sell at most 2.5M of X's 3M; the 500k between is buffer.
     enforceCapacityGuard: true,
-    capacityWarnAtUnits: 2_100_000,
-    capacityBlockAtUnits: 2_400_000,
-    trialCapacityUnits: 200,
+    xCommercialCeilingUnits: 2_500_000,
+    xProviderHardCapUnits: 3_000_000,
   },
   dunning: {
     pastDueBehavior: 'leave_past_due',
@@ -164,17 +135,13 @@ export const CHARGE_IMMEDIATELY: BillingPolicyShape = {
   rules: Object.fromEntries(
     Object.entries(OPTISIGNS_DEFAULT.rules).map(([key, value]) => [
       key,
-      // A quota-measured rule cannot be flipped to time-based proration without
-      // changing what it means, so it keeps its own settings.
-      key === 'addOnTierChange'
-        ? value
-        : {
-            ...value,
-            timing: 'immediate',
-            prorationBehavior: 'always_invoice',
-            paymentBehavior: 'error_if_incomplete',
-            notes: 'Change is invoiced and charged immediately.',
-          },
+      {
+        ...value,
+        timing: 'immediate',
+        prorationBehavior: 'always_invoice',
+        paymentBehavior: 'error_if_incomplete',
+        notes: 'Change is invoiced and charged immediately.',
+      },
     ]),
   ) as BillingPolicyShape['rules'],
   cancellation: {
@@ -287,15 +254,13 @@ export const NO_PRORATION: BillingPolicyShape = {
   rules: Object.fromEntries(
     Object.entries(OPTISIGNS_DEFAULT.rules).map(([key, value]) => [
       key,
-      key === 'addOnTierChange'
-        ? value
-        : {
-            ...value,
-            prorationBehavior: 'none',
-            billingCycleAnchor: 'unchanged',
-            creditHandling: 'none',
-            notes: 'Quantity changes now, money only changes at the next renewal.',
-          },
+      {
+        ...value,
+        prorationBehavior: 'none',
+        billingCycleAnchor: 'unchanged',
+        creditHandling: 'none',
+        notes: 'Quantity changes now, money only changes at the next renewal.',
+      },
     ]),
   ) as BillingPolicyShape['rules'],
 };
@@ -311,33 +276,23 @@ export const NO_PRORATION: BillingPolicyShape = {
  */
 export const SCIO_PORTAL_MVP: BillingPolicyShape = {
   ...OPTISIGNS_DEFAULT,
+  /*
+   * Row 67: dropping the base plan to Free is a scheduled downgrade that lands
+   * at the end of the base period already paid, never at the click. The X
+   * add-on keeps running to that boundary and ends with it.
+   */
   cancellation: {
     ...OPTISIGNS_DEFAULT.cancellation,
     timing: 'at_period_end',
     prorateUnusedTime: false,
     invoiceImmediately: false,
-    // cancelling is not a downgrade: the customer keeps what they paid for
-    // until the boundary and nothing is valued back to them
     refundUnusedTime: 'none',
   },
   constraints: {
     ...OPTISIGNS_DEFAULT.constraints,
     addOnsRequirePaidPlan: true,
   },
-  addOnRules: {
-    ...OPTISIGNS_DEFAULT.addOnRules,
-    x_social: {
-      ...(OPTISIGNS_DEFAULT.addOnRules?.x_social ?? {}),
-      remove: {
-        timing: 'end_of_period',
-        prorationBehavior: 'none',
-        paymentBehavior: 'allow_incomplete',
-        creditHandling: 'none',
-        notes:
-          'Dropping X Social is a cancellation, not a downgrade: the allowance stays usable until the renewal boundary and no money comes back. Moving between the two tiers is the path that hands back unspent posts.',
-      },
-    },
-  },
+  addOnRules: {},
 };
 
 export interface PresetDef {
@@ -352,7 +307,7 @@ export const PRESETS: PresetDef[] = [
     key: 'scio_portal_mvp',
     name: 'SCIO Portal (MVP)',
     description:
-      'The migration subset: Standard plan of one screen plus X Social Standard/Pro, monthly or annual. Giving up a tier returns the unspent allowance as credit; cancelling returns nothing and runs to the period end.',
+      'The migration subset: Standard plan plus the one X Social add-on ($20/mo or $216/yr, quantity 1). Money is prorated natively by Stripe; quota is SCIO\'s, granted by paid time on a quota month that starts on the billing anchor of the base plan and keeps it. Cancelling X freezes it at once and parks its item at quantity 0; only paid time after quotaMonthEnd is credited. Dropping the base plan to Free lands at the end of the paid base period.',
     policy: SCIO_PORTAL_MVP,
   },
   {

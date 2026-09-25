@@ -47,24 +47,16 @@ export class CatalogItem {
   @Prop({ default: false })
   boundToScreens!: boolean;
 
-  /** tiered add-ons in the same family swap prices instead of stacking items */
-  @Prop()
-  family?: string;
-
-  /** licensed per account: quantity is always 1, screen limits do not apply */
+  /** licensed per account, so screen limits do not apply */
   @Prop({ default: false })
   perAccount!: boolean;
 
-  /** metered allowance granted each month */
+  /** Post Updates of a fully paid quota month — informational, see x-addon/quota-math.ts */
   @Prop()
   quotaAllowance?: number;
 
   @Prop()
   quotaLabel?: string;
-
-  /** priced by allowance, never by the calendar */
-  @Prop({ default: false })
-  usagePriced!: boolean;
 
   @Prop({ type: [String], default: [] })
   features!: string[];

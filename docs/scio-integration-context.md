@@ -1,38 +1,38 @@
-# Context bàn giao — mang cơ chế billing sang SCIO Portal
+# Handover context — bringing the billing mechanism to SCIO Portal
 
-Viết cho người sẽ tích hợp cơ chế này vào SCIO Portal. Tóm tắt project đang có,
-cấu hình đã chốt, và phần nào port thẳng được / phần nào phải dựng lại.
+Written for whoever will integrate this mechanism into SCIO Portal. It summarises the current project,
+the settled configuration, and which parts port directly / which parts must be rebuilt.
 
 ---
 
-## 1. Vị trí project
+## 1. Project location
 
 | | |
 |---|---|
-| Thư mục trên máy | `/Users/ryanngo/Desktop/test-stripe` |
+| Directory on disk | `/Users/ryanngo/Desktop/test-stripe` |
 | Repo | https://github.com/quangtienngo661/test-stripe (branch `main`) |
 | Backend | NestJS, port **3123** |
 | Frontend | React + Vite, port **5555** |
 | MongoDB | port **27099** |
-| Khoá Stripe | `backend/.env` (**không** nằm trong repo; mẫu ở `backend/.env.example`) |
+| Stripe keys | `backend/.env` (**not** in the repo; template in `backend/.env.example`) |
 
-Chạy: `mongod --port 27099 --dbpath ./.mongo-data`, rồi `npm run dev` ở
-`backend/` và `npm run dev` ở `frontend/`. Chi tiết trong
-[README](../README.md) mục 1.
+Run: `mongod --port 27099 --dbpath ./.mongo-data`, then `npm run dev` in
+`backend/` and `npm run dev` in `frontend/`. Details in
+[README](../README.md) section 1.
 
 ---
 
-## 2. Project này là gì, và không là gì
+## 2. What this project is, and is not
 
-**Là:** một bản demo chạy được, mọi luật tính tiền là **cấu hình** chứ không phải
-code — sửa policy là đổi hành vi thật của Stripe, không phải đổi số học nội bộ.
-Toàn bộ con số trong docs đều đo từ Stripe test mode.
+**Is:** a runnable demo where every billing rule is **configuration** rather than
+code — editing the policy changes Stripe's real behaviour, not internal arithmetic.
+Every number in the docs is measured from Stripe test mode.
 
-**Không là:** hệ thống production. Không có auth, không có metering thật, không
-có webhook secret. Xem mục 7.
+**Is not:** a production system. There is no auth, no real metering, no
+webhook secret. See section 7.
 
-**Ý tưởng trung tâm đáng mang sang nhất:** một document policy duy nhất trong
-Mongo, mỗi nút trong đó ánh xạ thẳng sang một tham số Stripe. Bảng ánh xạ đầy đủ:
+**The central idea most worth carrying over:** a single policy document in
+Mongo, where each knob maps directly to a Stripe parameter. The full mapping table:
 [stripe-mapping.md](stripe-mapping.md).
 
 ---
@@ -44,153 +44,139 @@ Mongo, mỗi nút trong đó ánh xạ thẳng sang một tham số Stripe. Bả
 | NestJS | `^12.0.3` |
 | Stripe SDK | `^22.6.2` → API version **`2026-08-26.dahlia`** |
 | Mongoose | `^9.10.1` |
-| TypeScript | `^6.0.3` (bản 7 chưa có compiler API mà nest CLI cần) |
+| TypeScript | `^6.0.3` (version 7 does not yet have the compiler API that the nest CLI needs) |
 | React / Vite | `^19.3.0` / `^8.3.0` |
 
-API version quan trọng: ở `dahlia`, `current_period_*` nằm trên **SubscriptionItem**
-chứ không phải Subscription, và cờ proration nằm ở
+The API version matters: in `dahlia`, `current_period_*` lives on **SubscriptionItem**
+rather than Subscription, and the proration flag lives at
 `line.parent.subscription_item_details.proration`.
 
 ---
 
-## 4. Cấu hình đã chốt cho SCIO
+## 4. Settled configuration for SCIO
 
-Chọn preset **`scio_portal_mvp`** (tab Billing policy, hoặc
-`POST /api/policy/presets/scio_portal_mvp`). Định nghĩa ở
+Choose the **`scio_portal_mvp`** preset (Billing policy tab, or
+`POST /api/policy/presets/scio_portal_mvp`). Defined in
 [policy.presets.ts](../backend/src/policy/policy.presets.ts).
 
-### Danh mục trong phạm vi
+### In-scope catalogue
 
-| Mã | Tên | Tháng | Năm | Hạn mức |
+| Code | Name | Monthly | Yearly | Notes |
 |---|---|---|---|---|
-| `standard` | Standard plan | $10.00 | $9.00/th | **1 màn hình** |
-| `x_social_standard` | X Social Standard | $10.00 | $9.00/th | 600 post/tháng |
-| `x_social_pro` | X Social Pro | $30.00 | $27.00/th | 2.000 post/tháng |
+| `standard` | Standard plan | $10.00 | $108/year | per screen |
+| `x_social` | X Social | **$20.00** | **$216/year** | fixed quantity 1, 2,000 Post Updates / quota cycle |
 
-### Luật
+### Rules (MODEL V6)
 
-| Thao tác | Timing | Cách tính tiền | Tiền đi đâu |
-|---|---|---|---|
-| Mua X lần đầu | ngay | **đủ giá, đủ hạn mức** — không prorate theo ngày | trừ thẻ |
-| Nâng tier X | ngay | trả lại post chưa tiêu, tính đủ giá tier mới | trừ thẻ phần chênh |
-| **Hạ tier X** | ngay | `giá × post chưa tiêu / hạn mức` (+ tháng trọn chưa đụng) | **Stripe credit** |
-| **Bỏ X** | cuối kỳ | không tính gì | **không hoàn** |
-| Huỷ plan | cuối kỳ | không prorate | **không hoàn** |
-| Đổi term | ngay | plan theo **thời gian**, X theo **post** | credit hoặc trừ thẻ |
+| Operation | Money (Stripe) | Quota (SCIO) |
+|---|---|---|
+| Buy X | prorate to the billing boundary, collect immediately, if the card fails nothing changes | reserve 2,000 first; paid → grant `floor(2,000 × paid / month)` |
+| **Cancel X** | same item **quantity 1 → 0**, not deleted immediately; credit `quotaCycleEnd → xPaidThrough` only when `quotaCycleEnd < xPaidThrough`, for both monthly and yearly (with aligned cycles a monthly Cancel has nothing to credit) | FROZEN until the end of the quota cycle, fan-out off, FrozenRemaining kept |
+| Cleanup | at `AlreadyPaidUntil = min(oldPaidThrough, quotaCycleEnd)`: delete the quantity 0 item, `proration_behavior=none`, retry for up to 24 hours | only when still FROZEN, still quantity 0, and no purchase is in progress |
+| Buy X again | there is no restore button; it is a purchase — before `AlreadyPaidUntil` the same item goes 0 → 1, with no double charge | before `AlreadyPaidUntil` → restore FrozenRemaining; from then on → new activation, reusing the quantity 0 item if it still exists; the quota anchor never moves |
+| Change term | native together with the base plan (X ACTIVE); Stripe restarts billing | quota anchor unchanged; keep Used, only add the positive delta |
+| Cancel plan | at period end, no proration | X ENDED together with the plan |
 
-Ranh giới cốt lõi: **hạ gói thì prorate, huỷ thì không.**
+### Four hard constraints
 
-### Ba ràng buộc cứng
+1. A paid base plan is required before X can be bought (`addOnsRequirePaidPlan`, and the base
+   plan must not be in trial)
+2. X follows the base plan's interval
+3. One X per tenant, commercial quantity 1 (quantity 0 is only the technical FROZEN state)
+4. Capacity: `Committed + Pending + 2,000 ≤ 2,500,000` (`xCommercialCeilingUnits`)
 
-1. Phải có subscription trả phí mới mua được add-on (`addOnsRequirePaidPlan`)
-2. Chu kỳ do plan quyết định — add-on bắt buộc chạy theo, không có trạng thái
-   plan tháng + add-on năm
-3. Mỗi lúc chỉ giữ một tier X
+### Out of scope
 
-### Ngoài phạm vi
+Pro Plus, Engage, adding/removing screens, Background Music, Video Wall, Wireless
+Presentation, `planUpgrade`/`planDowngrade`. They remain in the system, but the MVP portal
+does not touch them.
 
-Pro Plus, Engage, thêm/bớt màn hình, Background Music, Video Wall, Wireless
-Presentation, `planUpgrade`/`planDowngrade`. Vẫn còn trong hệ thống, portal MVP
-không chạm tới.
-
-Chi tiết đầy đủ: [scio-portal-mvp.md](scio-portal-mvp.md).
+Full details: [scio-portal-mvp.md](scio-portal-mvp.md).
 
 ---
 
-## 5. Cơ chế cốt lõi cần hiểu trước khi port
+## 5. Core mechanisms to understand before porting
 
-### Phân giải rule — 3 tầng
+### Rule resolution — 3 layers
 
 [`policy.service.ts:191`](../backend/src/policy/policy.service.ts:191)
 
 ```ts
 return { ...rule, ...itemRule, ...(override ?? {}) };
-//        toàn cục   theo họ add-on   một lần duy nhất
+//        global     per add-on family   one-off
 ```
 
-Tầng giữa (`addOnRules`) là thứ cho phép X Social hành xử khác các add-on khác
-**mà không phải rẽ nhánh trong engine**.
+The middle layer (`addOnRules`) lets an add-on behave differently **without branching
+in the engine**. X Social does not use it: X's flow is hard-fixed by MODEL V6.
 
-### Nhánh usage vs time
+### X Social: two clocks
 
-[`subscriptions.service.ts:632`](../backend/src/subscriptions/subscriptions.service.ts:632)
-rẽ theo cờ `usagePriced` của mặt hàng. Nhánh usage tự tính tiền
-([`:1022`](../backend/src/subscriptions/subscriptions.service.ts:1022)), lịch
-không tham gia vào công thức.
-
-### Thứ tự tiền: tiền trước, subscription sau
-
-[`:1146`](../backend/src/subscriptions/subscriptions.service.ts:1146)
-
-1. `customers.createBalanceTransaction(-credit)` — credit vào trước
-2. `invoiceItems.create(charge)`
-3. `invoices.create({subscription, auto_advance: false})` — hút credit ở bước 1
-4. `finalizeInvoice` → `pay` nếu còn `amount_due`
-
-Hỏng ở bước nào thì `catch` cuốn ngược lại đúng bước đó. **Chỉ khi tiền xong
-xuôi subscription mới bị đổi.** Đây là lý do không bao giờ có hoá đơn âm: credit
-bị trừ vào hoá đơn dương thay vì tạo hoá đơn âm.
-
-### Gói năm = 12 hạn mức tháng
-
-Stripe chỉ gia hạn một lần mỗi năm nên không đánh dấu được 11 mốc tháng bên trong.
-Hệ thống tự mốc theo tháng lịch
-([`allowance-cycle.ts`](../backend/src/stripe/allowance-cycle.ts)), và đồng hồ
-post mang dấu tháng nó thuộc về — đọc sang tháng mới thì trả 0. **Suy ra lúc
-đọc, không có job hẹn giờ.**
+- Money: Stripe prorates natively — there is no hand-written calculation for X.
+- Quota: [`quota-math.ts`](../backend/src/x-addon/quota-math.ts) — pure functions,
+  replays coverage from paid invoices, quota cycle stepped in whole months from the tenant's
+  quota anchor (`account.xAddon.quotaAnchor` = the base plan's billing anchor when X is first
+  bought, kept through interval changes), true-up for the last quota cycle of a yearly term
+  once the cycles run apart. [`x-addon.service.ts`](../backend/src/x-addon/x-addon.service.ts) — state,
+  ledger, capacity, cancel / buy again / trial / quota deduction.
+- The quota cycle starts aligned with the billing month; a base-plan interval change restarts
+  Stripe's billing but not the quota cycle, so from then on the two run apart.
+- Reconcile runs **on every state read** and on receiving `invoice.paid`, so a missed
+  webhook only delays the grant, never loses or duplicates it.
 
 ---
 
-## 6. File phải đọc, theo thứ tự
+## 6. Files to read, in order
 
-1. [`policy.types.ts`](../backend/src/policy/policy.types.ts) — hình dạng cấu hình
-2. [`policy.presets.ts`](../backend/src/policy/policy.presets.ts) — giá trị chốt
-3. [`subscription.util.ts:64`](../backend/src/subscriptions/subscription.util.ts:64) `classifyChange` — nhận diện tình huống → chọn rule
-4. [`subscriptions.service.ts:591`](../backend/src/subscriptions/subscriptions.service.ts:591) `change()` — cửa vào
-5. [`:1022`](../backend/src/subscriptions/subscriptions.service.ts:1022) `quoteUsageSettlement` — công thức tiền của X
-6. [`:1111`](../backend/src/subscriptions/subscriptions.service.ts:1111) `applyWithUsageSettlement` — cơ chế thanh toán
+1. [`policy.types.ts`](../backend/src/policy/policy.types.ts) — shape of the configuration
+2. [`policy.presets.ts`](../backend/src/policy/policy.presets.ts) — settled values
+3. [`subscription.util.ts:64`](../backend/src/subscriptions/subscription.util.ts:64) `classifyChange` — identifies the situation → picks the rule
+4. [`subscriptions.service.ts`](../backend/src/subscriptions/subscriptions.service.ts) `change()` — entry point, branches to X when adding/removing `x_social`
+5. [`x-addon/quota-math.ts`](../backend/src/x-addon/quota-math.ts) — X's quota formula
+6. [`x-addon/x-addon.service.ts`](../backend/src/x-addon/x-addon.service.ts) — X lifecycle
 
 ---
 
-## 7. Phải tự dựng lại ở SCIO — **không port thẳng được**
+## 7. Must be rebuilt in SCIO — **cannot be ported directly**
 
-| Hạng mục | Tình trạng ở demo | Cần làm ở SCIO |
+| Item | Status in the demo | What SCIO needs |
 |---|---|---|
-| **Đếm post thật** | đồng hồ chỉnh tay (`PUT /api/accounts/:id/usage`) | nối vào hệ thống đếm post thật; engine đọc qua `accounts.readUsage()` nên chỉ cần thay nguồn |
-| **Trial của X** | **chưa dựng** | 14 ngày / 200 post / mỗi tài khoản một lần / chỉ khi plan nền là gói tháng |
-| **Webhook** | không có secret → dunning tự động không chạy | cấu hình `STRIPE_WEBHOOK_SECRET` |
-| **Auth** | không có, mọi endpoint mở | bắt buộc |
-| **Test clock** | dùng để tua thời gian | production không có; bỏ đường `nowFor()` hoặc để nó trả về giờ thật |
+| **Real post counting** | manual input field (`POST /api/x-addon/:id/sync-runs`) | every X fetch calls the same function with the real number of X Posts returned and billed, `actionId` is the SyncRun id |
+| **Compliance / fan-out** | only a `fanOut` flag | Global Batch Compliance, XAA `post.delete`, 24-hour lease outside billing |
+| **Webhook** | no secret → automatic dunning does not run | configure `STRIPE_WEBHOOK_SECRET` |
+| **Auth** | none, every endpoint is open | mandatory |
+| **Test clock** | used to fast-forward time | not available in production; remove the `nowFor()` path or make it return real time |
 
 ---
 
-## 8. Đã kiểm chứng tới đâu
+## 8. How far it has been verified
 
-`node scripts/verify.mjs` — **151 assertion, chạy trên Stripe test mode thật**,
-không phải mock. Bao gồm luồng X Social, lật hạn mức theo tháng, chặn hoá đơn âm,
-ràng buộc add-on cần plan.
+`node scripts/verify.mjs` — **runs against real Stripe test mode**, not
+mocks: plan, screens, per-unit add-ons, blocking negative invoices, the add-on-requires-plan
+constraint. X Social under MODEL V6 has its own suite `node scripts/verify-x-v6.mjs` (test
+clock set to the exact dates of the model's examples) and `node scripts/test-x-quota.mjs`
+(quota arithmetic, no Stripe needed).
 
-> Suite **đổi preset toàn cục** trong lúc chạy và reset về `optisigns_default` ở
-> cuối. Đừng chạy khi đang có người test trên cùng backend.
+> The suite **changes the global preset** while it runs and resets to `optisigns_default` at
+> the end. Do not run it while someone else is testing on the same backend.
 
 ---
 
-## 9. Bẫy đã gặp — đừng lặp lại
+## 9. Traps already hit — do not repeat them
 
-| Bẫy | Hậu quả | Cách tránh |
+| Trap | Consequence | How to avoid |
 |---|---|---|
-| `billing_cycle_anchor: 'now'` **re-price mọi dòng đang gắn** | dòng X đã settle tay bị tính thêm theo ngày | gỡ dòng usage ra → đổi term → gắn lại, cả ba bước `proration_behavior: 'none'` |
-| Đọc thời gian bằng đồng hồ máy | account có test clock bị tính sai prorate | mọi lần đọc giờ đi qua `stripe.nowFor(testClockId)` |
-| Nuốt lỗi khi đọc subscription | tạo trùng subscription thứ hai | chỉ `resource_missing`/404 mới coi là "không có"; lỗi khác phải ném |
-| `create_prorations` thì balance không đổi | tưởng credit không được cấp | đo bằng chênh lệch dòng proration giữa hai lần preview, với `proration_date` ghim cố định |
-| Nhầm gross/net khi hoàn tiền | từng hoàn dư $30 và ghi nợ hai lần | chọn gross hay net theo `prorationBehavior` |
-| Test clock chỉ nhảy được 2 interval ngắn nhất mỗi lần | nhảy 1 năm thất bại | chia chặng (`advanceInSteps`) |
+| Replaying coverage in the wrong order | cancelling then buying again within the same second is read as lost coverage | sort by `created` then invoice number; within one invoice negative lines first, positive lines after |
+| Reading time from the machine clock | accounts with a test clock get wrong proration | every time read goes through `stripe.nowFor(testClockId)` |
+| Swallowing errors when reading the subscription | a duplicate second subscription is created | only `resource_missing`/404 counts as "not there"; other errors must throw |
+| With `create_prorations` the balance does not change | looks as if no credit was granted | measure by the difference in proration lines between two previews, with `proration_date` pinned |
+| Confusing gross/net when refunding | once over-refunded $30 and debited twice | choose gross or net according to `prorationBehavior` |
+| Test clock can only jump 2 of the shortest intervals at a time | jumping 1 year fails | split into legs (`advanceInSteps`) |
 
 ---
 
-## 10. Tài liệu liên quan
+## 10. Related documents
 
-- [business-rules.md](business-rules.md) — luật đầy đủ, ngôn ngữ nghiệp vụ
-- [scio-portal-mvp.md](scio-portal-mvp.md) — phạm vi MVP chi tiết
-- [stripe-mapping.md](stripe-mapping.md) — từng nút → tham số Stripe
-- [optisigns-billing-model.md](optisigns-billing-model.md) — OptiSigns tính tiền thế nào
+- [business-rules.md](business-rules.md) — full rules, in business language
+- [scio-portal-mvp.md](scio-portal-mvp.md) — detailed MVP scope
+- [stripe-mapping.md](stripe-mapping.md) — each knob → Stripe parameter
+- [optisigns-billing-model.md](optisigns-billing-model.md) — how OptiSigns bills

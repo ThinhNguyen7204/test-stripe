@@ -8,10 +8,11 @@ import { CatalogItemDocument } from '../catalog/catalog.schema';
 import { BillingTerm } from '../catalog/catalog.constants';
 import { EventsService } from '../events/events.service';
 import { PolicyService } from '../policy/policy.service';
-import { ChangeRule, ChangeRuleKey, ConstraintPolicy } from '../policy/policy.types';
+import { ChangeRule, ChangeRuleKey } from '../policy/policy.types';
 import { StripeService } from '../stripe/stripe.service';
-import { allowanceCycle, remainingFraction } from '../stripe/allowance-cycle';
-import { ChangeRequest, DesiredState, UsageChange } from './subscription.types';
+import { X_ADDON_CODE } from '../x-addon/quota-math';
+import { SyncKind, XAddonService, XSubscriptionContext } from '../x-addon/x-addon.service';
+import { ChangeRequest, DesiredState } from './subscription.types';
 import {
   FREE,
   classifyChange,
@@ -40,6 +41,7 @@ export class SubscriptionsService {
     private readonly stripe: StripeService,
     private readonly events: EventsService,
     private readonly billing: BillingService,
+    private readonly xAddon: XAddonService,
   ) {}
 
   // ------------------------------------------------------------- catalog map
@@ -102,11 +104,20 @@ export class SubscriptionsService {
 
   // -------------------------------------------------------------- item build
 
+  /** A cancelled X add-on's item, kept at quantity 0 until AlreadyPaidUntil (MODEL V6 rows 49, 51). */
+  private parkedXItem(sub: Stripe.Subscription | null, maps: CatalogMaps): Stripe.SubscriptionItem | null {
+    return (
+      sub?.items?.data.find(
+        (i) => i.quantity === 0 && maps.byPriceId.get(typeof i.price === 'string' ? i.price : i.price?.id)?.code === X_ADDON_CODE,
+      ) ?? null
+    );
+  }
+
   private async buildItems(
     desired: DesiredState,
     sub: Stripe.Subscription | null,
     maps: CatalogMaps,
-    opts: { excludeUsagePriced?: boolean } = {},
+    opts: { omitParkedX?: boolean } = {},
   ): Promise<Stripe.SubscriptionUpdateParams.Item[]> {
     const existing = sub ? readSubscriptionState(sub, maps.byPriceId) : null;
     const items: Stripe.SubscriptionUpdateParams.Item[] = [];
@@ -121,44 +132,153 @@ export class SubscriptionsService {
     const desiredMap = new Map(desired.addOns.map((a) => [a.code, a.quantity]));
     const existingIds = existing?.addOnItemIds ?? {};
     const codes = new Set<string>([...desiredMap.keys(), ...Object.keys(existingIds)]);
-    const familyOf = (code: string) => maps.addOnItems.get(code)?.family;
-
-    /*
-     * Switching tier means repricing the line that is already there, not
-     * deleting one line and adding another — otherwise Stripe would credit the
-     * old tier and charge the new one on its own time-based terms, which is
-     * exactly the arithmetic a metered add-on must not use.
-     */
-    const reuse = new Map<string, string>();
-    const consumed = new Set<string>();
-    for (const code of desiredMap.keys()) {
-      if (existingIds[code]) continue;
-      const family = familyOf(code);
-      if (!family) continue;
-      const sibling = Object.keys(existingIds).find(
-        (c) => c !== code && familyOf(c) === family && !consumed.has(c),
-      );
-      if (sibling) {
-        reuse.set(code, existingIds[sibling]);
-        consumed.add(sibling);
-      }
-    }
 
     for (const code of codes) {
-      // usage-priced lines are settled by hand, so they must not ride along in
-      // an update whose proration settings are meant for everything else
-      if (opts.excludeUsagePriced && maps.addOnItems.get(code)?.usagePriced) continue;
       const quantity = desiredMap.get(code) ?? 0;
-      const itemId = existingIds[code] ?? reuse.get(code);
+      const itemId = existingIds[code];
+      const existingQuantity = sub?.items?.data.find((i) => i.id === itemId)?.quantity;
       if (quantity > 0) {
         const priceId = await this.catalog.priceIdFor(code, desired.term);
         items.push(itemId ? { id: itemId, price: priceId, quantity } : { price: priceId, quantity });
-      } else if (existingIds[code] && !consumed.has(code)) {
-        items.push({ id: existingIds[code], deleted: true });
+      } else if (itemId && code === X_ADDON_CODE && existingQuantity === 0 && opts.omitParkedX) {
+        // already moved to the new price on its own, with no proration — see moveParkedX()
+        continue;
+      } else if (itemId && code === X_ADDON_CODE && existingQuantity === 0) {
+        /*
+         * MODEL V6 rows 60, 64, CASE 9: a cancelled X add-on keeps its item at
+         * quantity 0 until AlreadyPaidUntil. It follows the new interval's price
+         * but stays at 0 — stated explicitly, because a price change otherwise
+         * resets quantity — so it is neither charged, credited nor switched back
+         * on. Deleting it here would take away what buying X again reuses.
+         */
+        const priceId = await this.catalog.priceIdFor(code, desired.term);
+        items.push({ id: itemId, price: priceId, quantity: 0 });
+      } else if (itemId) {
+        items.push({ id: itemId, deleted: true });
       }
     }
 
     return items;
+  }
+
+  /**
+   * MODEL V6 rows 60, 64, CASE 9: while FROZEN, an interval change moves the
+   * quantity-0 X item to the new price with no proration, and X is neither
+   * charged nor credited.
+   *
+   * It has to be its own request. Measured on Stripe test mode: after a Cancel
+   * set the item 1 → 0 with a future proration_date (quotaMonthEnd), Stripe
+   * still counts it at quantity 1 up to that date, so any change that restarts
+   * the billing period — even one that leaves the X item out — credits X for
+   * now → quotaMonthEnd, a stretch that funded this quota month. Moving the X
+   * item first with proration_behavior=none clears that, and the base plan's
+   * change that follows carries no X line at all.
+   */
+  private async moveParkedX(account: AccountDocument, sub: Stripe.Subscription, maps: CatalogMaps, term: BillingTerm) {
+    const parked = this.parkedXItem(sub, maps);
+    if (!parked) return null;
+    const price = await this.catalog.priceIdFor(X_ADDON_CODE, term);
+    const before = typeof parked.price === 'string' ? parked.price : parked.price.id;
+    if (before === price) return null;
+    const params: Stripe.SubscriptionUpdateParams = { items: [{ id: parked.id, price, quantity: 0 }], proration_behavior: 'none' };
+    await this.stripe.call('subscriptions.update (frozen X: new interval price, quantity 0, no proration)', () =>
+      this.stripe.client.subscriptions.update(sub.id, params),
+    );
+    await this.events.record({
+      accountId: account.id,
+      action: 'x.frozen_interval_moved',
+      summary: `Frozen X item ${parked.id} moved to the ${term} price at quantity 0 with proration_behavior=none — X is neither charged nor credited (MODEL V6 rows 60, 64).`,
+      stripeRequest: params as any,
+    });
+    return { itemId: parked.id, previousPrice: before };
+  }
+
+  // ------------------------------------------------------------------- X
+
+  private xContext(sub: Stripe.Subscription | null, term: BillingTerm): XSubscriptionContext {
+    return { sub, term, periodEnd: sub ? StripeService.periodEnd(sub) : null };
+  }
+
+  /** Whether this change takes the X add-on on or gives it up. */
+  private xMove(current: DesiredState, desired: DesiredState): 'add' | 'remove' | null {
+    const had = current.addOns.some((a) => a.code === X_ADDON_CODE);
+    const wants = desired.addOns.some((a) => a.code === X_ADDON_CODE);
+    if (had === wants) return null;
+    return wants ? 'add' : 'remove';
+  }
+
+  /** Anything besides the X add-on that the change would also move. */
+  private movesMoreThanX(current: DesiredState, desired: DesiredState): boolean {
+    const others = (state: DesiredState) =>
+      JSON.stringify({
+        planCode: state.planCode,
+        term: state.term,
+        screens: state.screens,
+        addOns: state.addOns.filter((a) => a.code !== X_ADDON_CODE),
+      });
+    return others(current) !== others(desired);
+  }
+
+  /*
+   * MODEL V6 fixes how the X add-on is bought, cancelled and bought again (rows 49,
+   * 51, 59): each has its own proration boundary, a capacity reservation and a
+   * paid gate. Folding one of them into an unrelated change would put the X
+   * item under that change's proration rule instead, so they travel alone.
+   */
+  private assertXAlone(current: DesiredState, desired: DesiredState) {
+    if (this.movesMoreThanX(current, desired)) {
+      throw new BadRequestException(
+        'Add or cancel the X add-on on its own: it has its own proration boundary, capacity reservation and paid gate (MODEL V6 rows 49, 51, 59). Apply the other changes first, then the X add-on.',
+      );
+    }
+  }
+
+  private async liveContext(account: AccountDocument) {
+    const maps = await this.catalogMaps();
+    const loaded = await this.loadSubscription(account);
+    const sub = loaded && ACTIVE_STATUSES.includes(loaded.status) ? loaded : null;
+    const current = this.currentStateOf(account, sub, maps);
+    return { maps, sub, current, ctx: this.xContext(sub, current.term) };
+  }
+
+  async cancelX(accountId: string) {
+    const account = await this.accounts.get(accountId);
+    const { maps, ctx } = await this.liveContext(account);
+    const updated = await this.xAddon.cancel(account, ctx);
+    await this.syncAccountFromSubscription(account, updated, maps);
+    return { applied: 'x_cancel', state: await this.getState(accountId) };
+  }
+
+  async previewX(accountId: string, action: 'purchase' | 'cancel') {
+    const account = await this.accounts.get(accountId);
+    const { ctx } = await this.liveContext(account);
+    if (action === 'cancel') return this.xAddon.previewCancel(account, ctx);
+    return this.xAddon.previewPurchase(account, ctx);
+  }
+
+  async startXTrial(accountId: string) {
+    const account = await this.accounts.get(accountId);
+    const { ctx } = await this.liveContext(account);
+    await this.xAddon.startTrial(account, ctx);
+    return this.getState(accountId);
+  }
+
+  async recordXSyncRun(
+    accountId: string,
+    body: { kind?: SyncKind; returned?: number; requested?: number; actionId?: string },
+  ) {
+    const account = await this.accounts.get(accountId);
+    const { ctx } = await this.liveContext(account);
+    const run = await this.xAddon.recordSyncRun(account, ctx, body ?? {});
+    return { run, state: await this.getState(accountId) };
+  }
+
+  async xSnapshot(accountId: string) {
+    const account = await this.accounts.get(accountId);
+    const loaded = await this.loadSubscription(account);
+    const maps = await this.catalogMaps();
+    const current = this.currentStateOf(account, loaded, maps);
+    return this.xAddon.snapshot(account, this.xContext(loaded, current.term));
   }
 
   // ------------------------------------------------------------------ state
@@ -215,52 +335,18 @@ export class SubscriptionsService {
       warnings.push('No payment method on file — invoices cannot be collected automatically.');
     }
 
-    // What allowance month each metered add-on is in, so the UI can say when the
-    // meter next rolls over instead of showing a bare count.
-    const usageCycle: Record<string, unknown> = {};
-    if (sub && state) {
-      const periodStart = StripeService.periodStart(sub) ?? 0;
-      const periodEnd = StripeService.periodEnd(sub) ?? 0;
-      const now = await this.stripe.nowFor(account.testClockId);
-      for (const addOn of state.addOns) {
-        const def = maps.addOnItems.get(addOn.code);
-        if (!def?.usagePriced || !def.family) continue;
-        const cycle = allowanceCycle(periodStart, periodEnd, now, state.term);
-        const quantity = addOn.quantity;
-        /*
-         * Quantity multiplies the allowance, and a month bought into part-way
-         * through holds less than a whole one — so the cap on screen is the one
-         * actually granted, not the price book's per-unit figure.
-         */
-        const fullAllowance = (def.quotaAllowance ?? 0) * quantity;
-        const listRate =
-          (state.term === 'yearly' ? def.annualMonthlyCents : def.monthlyCents) * quantity;
-        usageCycle[def.family] = {
-          ...cycle,
-          used: await this.accounts.readUsage(account, def.family),
-          allowance: await this.accounts.quotaCapFor(account, def.family, fullAllowance),
-          fullAllowance,
-          perUnitAllowance: def.quotaAllowance ?? 0,
-          quantity,
-          /*
-           * What this month actually cost. A hand-back is valued against this
-           * rather than against the list price (MODEL V5 row 8), so the UI has
-           * to quote it from here too — quoting the list price after a
-           * part-month purchase promises the customer money the engine will
-           * not pay.
-           */
-          invoicedCents: await this.accounts.quotaInvoicedFor(account, def.family, listRate),
-          listRateCents: listRate,
-          label: def.quotaLabel ?? 'allowance',
-        };
-      }
-    }
+    /*
+     * The X add-on is reconciled on every read: its paid coverage is replayed
+     * from Stripe's paid invoices, so a webhook that never arrived only delays
+     * a grant until the next look.
+     */
+    const xAddon = await this.xAddon.snapshot(account, this.xContext(sub, state.term));
 
     return {
       account,
       warnings,
       current: state,
-      usageCycle,
+      xAddon,
       monthlyValueCents: mrr,
       stripe: sub
         ? {
@@ -349,21 +435,30 @@ export class SubscriptionsService {
       desired.screens = Math.min(desired.screens, policy.constraints.freePlanScreenCap);
     }
     validateDesiredState({ desired, plan, addOnItems: maps.addOnItems, constraints: policy.constraints });
-    /*
-     * The preview reports the admission check rather than enforcing it, so the
-     * customer sees *why* the change would be refused before they commit to it.
-     * change() runs the same check as a gate.
-     */
-    const capacity = await this.checkCapacity(account, current, desired, maps, policy.constraints);
     const classification = classifyChange({ current, desired, plans: maps.plans, addOnItems: maps.addOnItems });
     const ruleKey = req.forceRuleKey ?? classification.ruleKey;
     const rule = ruleKey
-      ? await this.policy.resolveRule(ruleKey, req.overrides, classification.family ?? undefined)
+      ? await this.policy.resolveRule(ruleKey, req.overrides, classification.addOnCode ?? undefined)
       : null;
+
+    /*
+     * Taking the X add-on on or giving it up runs MODEL V6's own flows, so the
+     * preview is theirs too: the Stripe invoice for exactly those parameters,
+     * plus the quota it opens or freezes and the capacity it reserves.
+     */
+    const xMove = desired.planCode === FREE ? null : this.xMove(current, desired);
+    if (xMove && !sub) {
+      throw new BadRequestException('Start the base plan first — the X add-on is added to an existing paid subscription (MODEL V6 row 51).');
+    }
+    if (xMove && sub) {
+      this.assertXAlone(current, desired);
+      const ctx = this.xContext(sub, current.term);
+      const x = xMove === 'add' ? await this.xAddon.previewPurchase(account, ctx) : await this.xAddon.previewCancel(account, ctx);
+      return { current, desired, classification, ruleKey: null, rule: null, ...x };
+    }
 
     if (desired.planCode === FREE) {
       return {
-        capacity,
         current,
         desired,
         classification,
@@ -380,7 +475,9 @@ export class SubscriptionsService {
       };
     }
 
-    const items = await this.buildItems(desired, sub, maps);
+    const parkedX = this.parkedXItem(sub, maps);
+    const moveParkedX = Boolean(sub && parkedX && current.term !== desired.term);
+    const items = await this.buildItems(desired, sub, maps, { omitParkedX: moveParkedX });
     const prorationDate = await this.stripe.nowFor(account.testClockId);
 
     // A scheduled change does not touch the current invoice at all.
@@ -433,7 +530,6 @@ export class SubscriptionsService {
       if (unavailable) explanation.push(unavailable);
 
       return {
-        capacity,
         current,
         desired,
         classification,
@@ -445,141 +541,6 @@ export class SubscriptionsService {
         invoice: renewal ? this.stripe.summarizeInvoice(renewal) : null,
         previewUnavailable: unavailable,
         stripeParams: { call: 'subscriptionSchedules.update', items, preview: previewParams },
-      };
-    }
-
-    /*
-     * A metered tier switch is priced by the app, not by Stripe, so the preview
-     * shows the app's own arithmetic. Asking Stripe would return an invoice
-     * with no proration at all, which reads as "this change is free".
-     */
-    const previewDelta = sub ? this.quantityDelta(current, desired, maps) : null;
-    if (sub && previewDelta) {
-      const q = await this.quoteQuantityDelta(account, sub, previewDelta, desired.term);
-      const family = previewDelta.item.family ?? previewDelta.item.code;
-      const heldCap = await this.accounts.quotaCapFor(
-        account, family, (previewDelta.item.quotaAllowance ?? 0) * previewDelta.oldQuantity,
-      );
-      return {
-        capacity,
-        current,
-        desired,
-        classification,
-        ruleKey,
-        rule,
-        mode: 'quantity_delta',
-        quota: {
-          label: previewDelta.item.quotaLabel ?? null,
-          heldBefore: heldCap,
-          added: q.quotaAdded,
-          heldAfter: heldCap + q.quotaAdded,
-          formula: q.workings.quotaFormula,
-        },
-        breakdown: {
-          creditCents: 0,
-          chargeCents: q.charge,
-          existingCreditCents: Math.max(0, -(await this.customerBalance(account))),
-          dueNowCents: Math.max(0, q.charge - Math.max(0, -(await this.customerBalance(account)))),
-          chargeFormula: q.workings.chargeFormula,
-          remainingFraction: q.fraction,
-          monthsAhead: q.workings.monthsAhead,
-          delta: previewDelta.delta,
-        },
-        workings: q.workings,
-        explanation: [
-          `Policy rule: ${ruleKey}`,
-          `${previewDelta.delta} more ${previewDelta.item.name} licence(s): ${previewDelta.oldQuantity} → ${previewDelta.newQuantity}.`,
-          `The licences already held keep the ${heldCap} ${previewDelta.item.quotaLabel ?? 'units'} they were sold — nothing is handed back and the meter is untouched.`,
-          q.startsNextMonth
-            ? 'Too little of the month is left to sell any allowance, so the new licences start with the next allowance month and cost nothing now.'
-            : `The new licences buy the part of the month that is left: ${q.workings.quotaFormula}, costing ${(q.charge / 100).toFixed(2)} ${this.stripe.currency.toUpperCase()}.`,
-          `Allowance after this change: ${heldCap + q.quotaAdded}.`,
-          `Stripe proration stays off — the part-month is priced here, not by the day count.`,
-        ],
-        invoice: null,
-        stripeParams: { call: 'invoiceItems.create + subscriptions.update', workings: q.workings },
-      };
-    }
-
-    const previewUsageChange = sub ? this.usageAddOnChange(current, desired, maps) : null;
-    if (sub && previewUsageChange?.to) {
-      const previewFamily = previewUsageChange.from?.family ?? previewUsageChange.to.family;
-      const quote = await this.quoteUsageSettlement(account, sub, {
-        from: previewUsageChange.from,
-        to: previewUsageChange.to,
-        fromQuantity: previewUsageChange.fromQuantity,
-        toQuantity: previewUsageChange.toQuantity,
-        currentTerm: current.term,
-        term: desired.term,
-        quotaUsed: req.quotaUsed ?? (previewFamily ? await this.accounts.readUsage(account, previewFamily) : undefined),
-      });
-      const existingCredit = Math.max(0, -(await this.customerBalance(account)));
-      const dueNow = Math.max(0, quote.charge - quote.credit - existingCredit);
-      const currentTermForLabel = current.term;
-
-      return {
-        capacity,
-        current,
-        desired,
-        classification,
-        ruleKey,
-        rule,
-        mode: 'usage_settlement',
-        quota: {
-          label: (quote.from ?? quote.to)!.quotaLabel ?? null,
-          allowance: quote.workings.allowance,
-          used: quote.workings.quotaUsed,
-          unused: quote.workings.quotaUnused,
-          granted: quote.quotaGranted,
-          formula: quote.workings.quotaFormula,
-        },
-        breakdown: {
-          creditCents: quote.credit,
-          chargeCents: quote.charge,
-          existingCreditCents: existingCredit,
-          dueNowCents: dueNow,
-          creditFormula: quote.workings.creditFormula,
-          chargeFormula: quote.workings.chargeFormula,
-          monthsAhead: quote.workings.monthsAhead,
-          remainingFraction: quote.workings.remainingFraction,
-          partMonthCharge: quote.workings.partMonthCharge,
-          fromQuantity: quote.workings.fromQuantity,
-          toQuantity: quote.workings.toQuantity,
-          invoicedForCycle: quote.workings.invoicedForCycle,
-        },
-        workings: quote.workings,
-        explanation: [
-          `Policy rule: ${ruleKey}`,
-          /*
-           * Same code on both sides used to mean only one thing — a change of
-           * billing term. It now also covers a change of quantity, so the line
-           * has to say which of the two actually moved instead of announcing a
-           * term switch that is not happening.
-           */
-          `${
-            !quote.from
-              ? quote.to!.name
-              : quote.from.code !== quote.to!.code
-                ? `${quote.from.name} → ${quote.to!.name}`
-                : currentTermForLabel !== desired.term
-                  ? `${quote.to!.name} moving to the ${desired.term} term`
-                  : `${quote.to!.name} going from ${quote.workings.fromQuantity} to ${quote.workings.toQuantity} licence(s)`
-          }, settled on allowance rather than on Stripe's day-count.`,
-          `${quote.workings.fromQuantity} → ${quote.workings.toQuantity} licence(s); quantity multiplies both the price and the ${(quote.from ?? quote.to)!.quotaLabel ?? 'allowance'}.`,
-          ...(quote.from
-            ? [
-                `Handed back: ${quote.workings.quotaUnused} of the ${quote.workings.allowance} granted this month, valued against the ${(quote.workings.invoicedForCycle / 100).toFixed(2)} ${this.stripe.currency.toUpperCase()} actually invoiced for it${quote.workings.monthsAhead ? `, plus ${quote.workings.monthsAhead} untouched month(s) in full` : ''} → ${(quote.credit / 100).toFixed(2)} ${this.stripe.currency.toUpperCase()} of account credit.`,
-              ]
-            : []),
-          quote.workings.partMonthCharge
-            ? `${(quote.workings.remainingFraction * 100).toFixed(1)}% of this allowance month is still ahead, so ${quote.to!.name} is sold by that slice: ${quote.workings.quotaFormula}, costing ${(quote.workings.partMonthCharge / 100).toFixed(2)} ${this.stripe.currency.toUpperCase()}${quote.workings.monthsBought > 1 ? ` plus ${quote.workings.monthsBought - 1} whole month(s) up front` : ''}.`
-            : `The term change restarts the cycle, so ${quote.to!.name} is sold as ${quote.workings.monthsBought} whole month(s) at the list price, ${quote.workings.quotaGranted.toLocaleString()} ${quote.to!.quotaLabel ?? 'units'} each — no month is part-spent, so nothing is sliced.`,
-          `Stripe proration stays off, so the invoice only ever carries the new configuration — it never goes negative.`,
-          `Card is charged ${(dueNow / 100).toFixed(2)} ${this.stripe.currency.toUpperCase()} after the credit is applied.`,
-        ],
-        invoice: null,
-        previewUnavailable: null,
-        stripeParams: { call: 'invoiceItems.create + customers.createBalanceTransaction + invoices.create', workings: quote.workings },
       };
     }
 
@@ -652,9 +613,35 @@ export class SubscriptionsService {
     }
 
     if (previewUnavailable) explanation.push(previewUnavailable);
+    if (sub && current.term !== desired.term && desired.addOns.some((a) => a.code === X_ADDON_CODE)) {
+      explanation.push(
+        'The X add-on follows the base interval (MODEL V6 rows 60, 64): Stripe prorates it natively with the base plan. SCIO keeps the quota month and Used as they are and only adds a positive delta if the paid coverage grows — the same stretch of time is never granted twice.',
+        'The quota cycle does not move with it: it keeps the anchor X was bought on, while billing restarts on the new interval. From this change on, quota months and billing periods run on separate cycles.',
+      );
+    }
+    let summary = invoice ? this.stripe.summarizeInvoice(invoice) : null;
+    if (moveParkedX && parkedX) {
+      explanation.push(
+        `The X add-on is cancelled (FROZEN): its item ${parkedX.id} moves to the ${desired.term} price but stays at quantity 0 (MODEL V6 rows 60, 64, CASE 9) — not charged, not credited and not switched back on. Buying X again is the only way back.`,
+        'That move is its own request, sent first with proration_behavior=none; the base plan change follows and carries no X line. Stripe cannot preview the two together, so any X line it prices here is left out of the invoice below.',
+      );
+      if (summary) {
+        const xPrices = [...maps.byPriceId.entries()].filter(([, v]) => v.code === X_ADDON_CODE).map(([id]) => id);
+        const dropped = summary.lines.filter((l) => l.priceId && xPrices.includes(l.priceId));
+        const cut = dropped.reduce((s, l) => s + l.amount, 0);
+        summary = {
+          ...summary,
+          lines: summary.lines.filter((l) => !dropped.includes(l)),
+          subtotal: summary.subtotal - cut,
+          total: summary.total - cut,
+          amountDue: Math.max(0, summary.amountDue - cut),
+          prorationTotal: summary.prorationTotal - dropped.filter((l) => l.proration).reduce((s, l) => s + l.amount, 0),
+          recurringTotal: summary.recurringTotal - dropped.filter((l) => !l.proration).reduce((s, l) => s + l.amount, 0),
+        };
+      }
+    }
 
     return {
-      capacity,
       current,
       desired,
       classification,
@@ -663,7 +650,7 @@ export class SubscriptionsService {
       mode: sub ? 'update' : 'create',
       trial: trial ? { willApply: trial.apply, reason: trial.reason, days: policy.trial.days, error: trial.error ?? null } : null,
       explanation,
-      invoice: invoice ? this.stripe.summarizeInvoice(invoice) : null,
+      invoice: summary,
       previewUnavailable,
       stripeParams: previewParams,
     };
@@ -726,12 +713,18 @@ export class SubscriptionsService {
       return this.cancel(accountId, { reason: 'Downgrade to the Free plan' });
     }
     validateDesiredState({ desired, plan, addOnItems: maps.addOnItems, constraints: policy.constraints });
-    /*
-     * Admission control runs before a single Stripe call: MODEL V5 row 48 wants
-     * the capacity check to pass *before* the invoice is created, so a refusal
-     * leaves nothing to unwind.
-     */
-    await this.assertCapacityAdmits(account, current, desired, maps, policy.constraints);
+
+    const xMove = this.xMove(current, desired);
+    if (xMove && !sub) {
+      throw new BadRequestException('Start the base plan first — the X add-on is added to an existing paid subscription (MODEL V6 row 51).');
+    }
+    if (xMove && sub) {
+      this.assertXAlone(current, desired);
+      const ctx = this.xContext(sub, current.term);
+      const updated = xMove === 'add' ? await this.xAddon.purchase(account, ctx) : await this.xAddon.cancel(account, ctx);
+      await this.syncAccountFromSubscription(account, updated, maps);
+      return { applied: xMove === 'add' ? 'x_purchase' : 'x_cancel', state: await this.getState(accountId) };
+    }
 
     const classification = classifyChange({ current, desired, plans: maps.plans, addOnItems: maps.addOnItems });
     if (!classification.ruleKey && sub) {
@@ -739,43 +732,12 @@ export class SubscriptionsService {
     }
 
     const ruleKey = (req.forceRuleKey ?? classification.ruleKey ?? 'screensIncrease') as ChangeRuleKey;
-    const rule = await this.policy.resolveRule(ruleKey, req.overrides, classification.family ?? undefined);
+    const rule = await this.policy.resolveRule(ruleKey, req.overrides, classification.addOnCode ?? undefined);
 
     if (!sub) {
       return this.createSubscription(account, desired, maps, { withTrial: req.withTrial });
     }
 
-    /*
-     * Anything that takes on a usage-priced add-on — first purchase, tier
-     * switch, or carrying it across a change of billing term — is settled on
-     * allowance rather than on days. Giving one up is not: that is governed by
-     * its own rule and moves no money.
-     */
-    /*
-     * Buying more of what is already held settles additively (no hand-back), so
-     * it is checked before the replace-everything flow claims the change.
-     */
-    const delta = this.quantityDelta(current, desired, maps);
-    if (delta) {
-      return this.applyQuantityDeltaChange(
-        account, sub, desired, maps, rule, ruleKey, classification, delta,
-      );
-    }
-
-    const usageChange = this.usageAddOnChange(current, desired, maps);
-    if (usageChange?.to) {
-      // the request may override it, otherwise read the account's meter. A meter
-      // that was never written means nothing has been posted yet, which is a real
-      // reading of zero, not a missing one — so a term switch on an untouched
-      // account settles at the full allowance instead of being refused. A reading
-      // stamped with an allowance month that has passed comes back as zero.
-      const family = usageChange.from?.family ?? usageChange.to.family;
-      const metered = family ? await this.accounts.readUsage(account, family) : undefined;
-      return this.applyWithUsageSettlement(
-        account, sub, desired, maps, rule, ruleKey, classification,
-        req.quotaUsed ?? metered, usageChange,
-      );
-    }
     if (rule.timing === 'end_of_period') {
       return this.scheduleChange(account, sub, desired, maps, rule, ruleKey, classification);
     }
@@ -933,8 +895,12 @@ export class SubscriptionsService {
       }
     }
 
+    // MODEL V6 rows 60, 64: a frozen X item moves first, on its own, with no proration
+    const moved = readSubscriptionState(sub, maps.byPriceId).term !== desired.term
+      ? await this.moveParkedX(account, sub, maps, desired.term)
+      : null;
     const balanceBefore = await this.customerBalance(account);
-    const items = await this.buildItems(desired, sub, maps);
+    const items = await this.buildItems(desired, sub, maps, { omitParkedX: Boolean(moved) });
     const prorationDate = await this.stripe.nowFor(account.testClockId);
 
     /*
@@ -982,9 +948,20 @@ export class SubscriptionsService {
       params.proration_date = prorationDate;
     }
 
-    const updated = await this.stripe.call('subscriptions.update', () =>
-      this.stripe.client.subscriptions.update(sub.id, params),
-    );
+    let updated: Stripe.Subscription;
+    try {
+      updated = await this.stripe.call('subscriptions.update', () =>
+        this.stripe.client.subscriptions.update(sub.id, params),
+      );
+    } catch (err) {
+      // put the frozen X item back on the old price, so a refused change leaves nothing half-done
+      if (moved) {
+        await this.stripe.client.subscriptions
+          .update(sub.id, { items: [{ id: moved.itemId, price: moved.previousPrice, quantity: 0 }], proration_behavior: 'none' })
+          .catch((e) => this.logger.error(`Could not move frozen X item ${moved.itemId} back: ${e.message}`));
+      }
+      throw err;
+    }
 
     const balanceAfter = await this.customerBalance(account);
     // Stripe balances are negative when the customer is in credit.
@@ -1098,909 +1075,6 @@ export class SubscriptionsService {
       creditOnBalanceCents: creditOnBalance,
       refund: refundResult,
       latestInvoice,
-      state: await this.getState(account.id),
-    };
-  }
-
-  /**
-   * Switching tier on a metered add-on.
-   *
-   * Stripe can only value the unused part of a subscription in days, but what
-   * the customer has left on a metered add-on is measured in allowance, not
-   * time. So Stripe's proration is switched off and the money is assembled by
-   * hand: credit the unused allowance of the old tier, bill the new tier for
-   * the days that remain, and let the credit absorb that bill.
-   *
-   * Money moves before the subscription does, so a declined card leaves the
-   * customer on the tier they were already paying for.
-   */
-  /**
-   * Which usage-priced add-on is being taken or given up, if any.
-   *
-   * A change of billing term counts too: the same tier on a yearly price is a
-   * different purchase, and it must not be valued by the calendar either.
-   */
-  /**
-   * Refuse a change that would push the upstream provider budget past its
-   * ceiling (MODEL V5 row 17).
-   *
-   * What is committed is what has been sold: every usage-priced licence held
-   * anywhere, times its monthly allowance, plus a nominal amount for each
-   * running trial. The check runs *before* any invoice is raised (row 48), and
-   * only against changes that raise the figure — giving capacity back is
-   * always allowed (row 63).
-   */
-  private async checkCapacity(
-    account: AccountDocument,
-    current: DesiredState,
-    desired: DesiredState,
-    maps: CatalogMaps,
-    constraints: ConstraintPolicy,
-    opts: { startingTrial?: boolean } = {},
-  ): Promise<{ projected: number; before: number; warning: string | null; blocked: string | null }> {
-    const allowanceByCode = new Map<string, number>();
-    for (const [code, def] of maps.addOnItems) {
-      if (def.usagePriced && def.quotaAllowance) allowanceByCode.set(code, def.quotaAllowance);
-    }
-    const commitOf = (state: DesiredState) =>
-      state.addOns.reduce((sum, a) => sum + (allowanceByCode.get(a.code) ?? 0) * a.quantity, 0);
-
-    const mine = commitOf(desired);
-    const minePrevious = commitOf(current);
-    if (!constraints.enforceCapacityGuard) {
-      return { projected: mine, before: minePrevious, warning: null, blocked: null };
-    }
-
-    const trialUnits = constraints.trialCapacityUnits ?? 0;
-    const others = await this.accounts.committedCapacityExcluding(account.id, allowanceByCode, trialUnits);
-    const wasTrialing = account.subscriptionStatus === 'trialing';
-    const willTrial = opts.startingTrial ?? wasTrialing;
-    const projected = others.total + mine + (willTrial ? trialUnits : 0);
-    const before = others.total + minePrevious + (wasTrialing ? trialUnits : 0);
-
-    const fmt = (n: number) => n.toLocaleString('en-US');
-    // Only a change that asks for more has to pass; releasing capacity never does.
-    const blocked =
-      projected > before && projected > constraints.capacityBlockAtUnits
-        ? `This change would commit ${fmt(projected)} post updates a month across the platform, past the ` +
-          `${fmt(constraints.capacityBlockAtUnits)} provider budget. Nothing was changed. ` +
-          `Reduce the quantity, or raise constraints.capacityBlockAtUnits if the upstream budget really has grown.`
-        : null;
-
-    const warning =
-      !blocked && projected > constraints.capacityWarnAtUnits
-        ? `Committed provider capacity is ${fmt(projected)} post updates a month, past the ` +
-          `${fmt(constraints.capacityWarnAtUnits)} warning line.`
-        : null;
-    return { projected, before, warning, blocked };
-  }
-
-  /** The same check, as a gate: MODEL V5 row 48 wants it to fail before any invoice exists. */
-  private async assertCapacityAdmits(
-    account: AccountDocument,
-    current: DesiredState,
-    desired: DesiredState,
-    maps: CatalogMaps,
-    constraints: ConstraintPolicy,
-    opts: { startingTrial?: boolean } = {},
-  ) {
-    const result = await this.checkCapacity(account, current, desired, maps, constraints, opts);
-    if (result.blocked) throw new BadRequestException(result.blocked);
-    return result;
-  }
-
-  /**
-   * Buying more licences of the tier already held, on the same term.
-   *
-   * This is the one change that is *additive* rather than a replacement. The
-   * licences already on the item were sold their quota for this month and keep
-   * it; the new ones buy the part of the month that is left, at the same rate
-   * per post. Nothing is handed back, the meter is untouched, and the grant
-   * accumulates on top of what is already there — so a customer who buys more
-   * never ends up with less.
-   *
-   * Everything else — a change of tier, a reduction, a change of term — still
-   * runs the replace-everything flow in applyWithUsageSettlement().
-   */
-  private quantityDelta(
-    current: DesiredState,
-    desired: DesiredState,
-    maps: CatalogMaps,
-  ): { item: CatalogItemDocument; oldQuantity: number; newQuantity: number; delta: number } | null {
-    if (current.term !== desired.term) return null;
-    const pick = (state: DesiredState) => {
-      const held = state.addOns.find((a) => maps.addOnItems.get(a.code)?.usagePriced);
-      return held ? { code: held.code, quantity: held.quantity } : null;
-    };
-    const from = pick(current);
-    const to = pick(desired);
-    if (!from || !to) return null;
-    if (from.code !== to.code) return null;
-    if (to.quantity <= from.quantity) return null;
-    const item = maps.addOnItems.get(to.code);
-    if (!item) return null;
-    return {
-      item,
-      oldQuantity: from.quantity,
-      newQuantity: to.quantity,
-      delta: to.quantity - from.quantity,
-    };
-  }
-
-  /**
-   * Prices that additive purchase. Same shape as a first purchase (row 47) with
-   * the licences already held as the base, which is why the two agree: buying
-   * the first four and then two more costs exactly what buying six in two steps
-   * should, and the rate per post never moves.
-   */
-  private async quoteQuantityDelta(
-    account: AccountDocument,
-    sub: Stripe.Subscription,
-    d: { item: CatalogItemDocument; oldQuantity: number; newQuantity: number; delta: number },
-    term: BillingTerm,
-  ) {
-    const periodStart = StripeService.periodStart(sub) ?? 0;
-    const periodEnd = StripeService.periodEnd(sub) ?? 0;
-    const now = await this.stripe.nowFor(account.testClockId);
-    const cycle = allowanceCycle(periodStart, periodEnd, now, term);
-    const fraction = remainingFraction(cycle, now);
-
-    const perUnitPrice = term === 'yearly' ? d.item.annualMonthlyCents : d.item.monthlyCents;
-    const perUnitAllowance = d.item.quotaAllowance ?? 0;
-    const rate = perUnitPrice * d.delta;
-
-    let quotaAdded = Math.floor(perUnitAllowance * d.delta * fraction);
-    let partMonthCharge = Math.round(rate * fraction);
-    let charge = partMonthCharge + rate * cycle.monthsAhead;
-
-    /*
-     * So little of the month is left that the new licences would buy no posts
-     * at all. Charging for nothing breaks the one rule this add-on is built on,
-     * so they simply start with the next allowance month instead.
-     */
-    const startsNextMonth = quotaAdded === 0 && cycle.monthsAhead === 0;
-    if (startsNextMonth) {
-      quotaAdded = 0;
-      partMonthCharge = 0;
-      charge = 0;
-    }
-
-    return {
-      cycle,
-      fraction,
-      quotaAdded,
-      charge,
-      partMonthCharge,
-      startsNextMonth,
-      workings: {
-        basis: 'quantity_delta',
-        term,
-        code: d.item.code,
-        fromQuantity: d.oldQuantity,
-        toQuantity: d.newQuantity,
-        delta: d.delta,
-        remainingFraction: fraction,
-        monthsAhead: cycle.monthsAhead,
-        perUnitPriceCents: perUnitPrice,
-        perUnitAllowance,
-        quotaAdded,
-        partMonthCharge,
-        chargeCents: charge,
-        creditCents: 0,
-        startsNextMonth,
-        chargeFormula: startsNextMonth
-          ? 'no allowance left to sell this month — the new licences start next month, free'
-          : `${perUnitPrice} × ${d.delta} × ${(fraction * 100).toFixed(1)}% of the month left` +
-            (cycle.monthsAhead ? ` + ${rate} × ${cycle.monthsAhead} whole months` : ''),
-        quotaFormula: `floor(${perUnitAllowance} × ${d.delta} × ${(fraction * 100).toFixed(1)}%) = ${quotaAdded}`,
-      },
-    };
-  }
-
-  /**
-   * Applies the additive purchase: collect for the new licences, move the
-   * quantity on the existing item, then top up the grant.
-   *
-   * The order matters. Nothing is granted until the money is in (row 47's paid
-   * gate), and if collection fails the invoice item is removed so a retry does
-   * not bill twice. Stripe prorates nothing — the app has already priced the
-   * part-month itself.
-   */
-  private async applyQuantityDeltaChange(
-    account: AccountDocument,
-    sub: Stripe.Subscription,
-    desired: DesiredState,
-    maps: CatalogMaps,
-    rule: ChangeRule,
-    ruleKey: ChangeRuleKey,
-    classification: any,
-    d: { item: CatalogItemDocument; oldQuantity: number; newQuantity: number; delta: number },
-  ) {
-    const quote = await this.quoteQuantityDelta(account, sub, d, desired.term);
-    const { workings } = quote;
-    const currency = this.stripe.currency;
-    const family = d.item.family ?? d.item.code;
-    const label = `${d.item.name} ${d.oldQuantity} → ${d.newQuantity} licences`;
-
-    let invoiceItemId: string | null = null;
-    let invoice: Stripe.Invoice | null = null;
-    try {
-      if (quote.charge > 0) {
-        const item = await this.stripe.client.invoiceItems.create({
-          customer: account.stripeCustomerId!,
-          subscription: sub.id,
-          amount: quote.charge,
-          currency,
-          description:
-            `${d.item.name} — ${d.delta} more licence(s), ${quote.quotaAdded} ` +
-            `${d.item.quotaLabel ?? 'units'} for the rest of this month` +
-            (workings.monthsAhead ? ` + ${workings.monthsAhead} whole months` : ''),
-        });
-        invoiceItemId = item.id;
-        invoice = await this.stripe.client.invoices.create({
-          customer: account.stripeCustomerId!,
-          subscription: sub.id,
-          auto_advance: false,
-          description: label,
-        });
-        invoice = await this.stripe.client.invoices.finalizeInvoice(invoice.id!);
-        if (invoice.amount_due > 0) invoice = await this.stripe.client.invoices.pay(invoice.id!);
-      }
-    } catch (err: any) {
-      if (invoice && invoice.status !== 'paid') {
-        try {
-          await this.stripe.client.invoices.voidInvoice(invoice.id!);
-        } catch (e: any) {
-          this.logger.warn(`Rollback: could not void ${invoice.id}: ${e.message}`);
-        }
-      } else if (invoiceItemId) {
-        try {
-          await this.stripe.client.invoiceItems.del(invoiceItemId);
-        } catch (e: any) {
-          this.logger.warn(`Rollback: could not delete ${invoiceItemId}: ${e.message}`);
-        }
-      }
-      await this.events.record({
-        accountId: account.id,
-        action: 'subscription.quantity_increase_failed',
-        ruleKey,
-        summary: `${label} rejected: ${err?.raw?.message ?? err.message}`,
-        policyApplied: rule as any,
-        stripeRequest: workings as any,
-        error: { message: err?.raw?.message ?? err.message, code: err?.raw?.code },
-      });
-      throw new BadRequestException(
-        `Could not collect ${(quote.charge / 100).toFixed(2)} ${currency.toUpperCase()} for ${d.delta} more ` +
-          `${d.item.name} licence(s): ${err?.raw?.message ?? err.message}. Nothing was changed — still ${d.oldQuantity}.`,
-      );
-    }
-
-    // Paid for, so the licences can move. Stripe must not prorate on top.
-    const items = await this.buildItems(desired, sub, maps);
-    const updated = await this.stripe.call('subscriptions.update (quantity delta)', () =>
-      this.stripe.client.subscriptions.update(sub.id, {
-        items,
-        proration_behavior: 'none',
-        metadata: { accountId: account.id, planCode: desired.planCode, term: desired.term },
-        expand: ['latest_invoice'],
-      }),
-    );
-
-    /*
-     * Top up rather than overwrite: a hand-back later this month is valued
-     * against everything invoiced for the family this month, and measured
-     * against every post granted for it.
-     */
-    if (quote.quotaAdded > 0 || quote.charge > 0) {
-      await this.accounts.addQuotaGrant(
-        account,
-        family,
-        { cap: quote.quotaAdded, cents: quote.charge },
-        {
-          fullAllowance: (d.item.quotaAllowance ?? 0) * d.oldQuantity,
-          listRateCents:
-            (desired.term === 'yearly' ? d.item.annualMonthlyCents : d.item.monthlyCents) *
-            d.oldQuantity,
-        },
-      );
-    }
-
-    await this.syncAccountFromSubscription(account, updated, maps);
-    const summary = await this.stripe.summarizeInvoice(invoice ?? undefined);
-
-    await this.events.record({
-      accountId: account.id,
-      action: 'subscription.quantity_increased',
-      ruleKey,
-      summary:
-        `${label} · ${(quote.charge / 100).toFixed(2)} ${currency.toUpperCase()} · ` +
-        `+${quote.quotaAdded} ${d.item.quotaLabel ?? 'units'}` +
-        (quote.startsNextMonth ? ' (starts next allowance month)' : ''),
-      policyApplied: rule as any,
-      stripeRequest: workings as any,
-      result: { invoice: summary },
-    });
-
-    return {
-      applied: 'quantity_delta',
-      ruleKey,
-      rule,
-      classification,
-      quota: {
-        added: quote.quotaAdded,
-        label: d.item.quotaLabel ?? null,
-        startsNextMonth: quote.startsNextMonth,
-      },
-      creditCents: 0,
-      chargeCents: quote.charge,
-      workings,
-      latestInvoice: invoice ? summary : null,
-      state: await this.getState(account.id),
-    };
-  }
-
-  /** A move on the usage-priced line: tier, quantity, or both. */
-  private usageAddOnChange(
-    current: DesiredState,
-    desired: DesiredState,
-    maps: CatalogMaps,
-  ): UsageChange | null {
-    const pick = (state: DesiredState) => {
-      const held = state.addOns.find((a) => maps.addOnItems.get(a.code)?.usagePriced);
-      return held ? { code: held.code, quantity: held.quantity } : null;
-    };
-    const fromHeld = pick(current);
-    const toHeld = pick(desired);
-    if (!fromHeld && !toHeld) return null;
-    /*
-     * Quantity counts as a move. It buys or gives up allowance exactly as a
-     * tier switch does, so it has to be settled on allowance rather than left
-     * to Stripe's day-count — MODEL V5 puts quantity adjustments through the
-     * same flow as a tier change (row 8).
-     */
-    if (
-      fromHeld?.code === toHeld?.code &&
-      fromHeld?.quantity === toHeld?.quantity &&
-      current.term === desired.term
-    ) {
-      return null;
-    }
-    /*
-     * Buying more of what is already held is not a reconfiguration: the licences
-     * already there keep the quota they were sold and nothing is handed back.
-     * That case is settled additively by quantityDelta() instead, so the
-     * replace-everything flow must not claim it.
-     */
-    if (this.quantityDelta(current, desired, maps)) return null;
-    return {
-      from: fromHeld ? maps.addOnItems.get(fromHeld.code) ?? null : null,
-      to: toHeld ? maps.addOnItems.get(toHeld.code) ?? null : null,
-      fromQuantity: fromHeld?.quantity ?? 0,
-      toQuantity: toHeld?.quantity ?? 0,
-    };
-  }
-
-  /**
-   * The money for a usage-priced add-on. Nothing here is measured in days.
-   *
-   * What the customer bought is an allowance, so what they are owed back is the
-   * share of that allowance they never spent — on day 2 or day 29, unspent is
-   * unspent. Taking a tier costs its full price and grants its full allowance.
-   *
-   * On an annual term the allowance still resets every month, so the period is
-   * read as a run of months: the month in progress is settled on what was used,
-   * and the whole months still ahead were never touched at all, so they are
-   * returned in full. (MODEL V5 calls this splitting the two parts.)
-   *
-   * Computed in one place and shared by the preview and the change itself, so
-   * the figure quoted is always the figure charged.
-   */
-  private async quoteUsageSettlement(
-    account: AccountDocument,
-    sub: Stripe.Subscription,
-    opts: {
-      from?: CatalogItemDocument | null;
-      to?: CatalogItemDocument | null;
-      /** the term the customer is on now — what the old tier was actually sold at */
-      currentTerm: BillingTerm;
-      /** the term being moved to — what the new tier is sold at */
-      term: BillingTerm;
-      quotaUsed?: number;
-      /** licences held before and after; quantity multiplies price and allowance alike */
-      fromQuantity?: number;
-      toQuantity?: number;
-    },
-  ) {
-    const { from, to, currentTerm, term } = opts;
-    const fromQuantity = Math.max(0, Math.floor(Number(opts.fromQuantity ?? (from ? 1 : 0))));
-    const toQuantity = Math.max(0, Math.floor(Number(opts.toQuantity ?? (to ? 1 : 0))));
-    const rateOn = (item: CatalogItemDocument, t: BillingTerm) =>
-      t === 'yearly' ? item.annualMonthlyCents : item.monthlyCents;
-
-    const periodStart = StripeService.periodStart(sub) ?? 0;
-    const periodEnd = StripeService.periodEnd(sub) ?? 0;
-    const now = await this.stripe.nowFor(account.testClockId);
-    /*
-     * The month in progress is settled on what was spent in it; the months
-     * after it were never touched and come back whole. Both readings come from
-     * the one helper that also decides when the meter rolls over, so a boundary
-     * can never be counted twice or missed.
-     */
-    const cycle = allowanceCycle(periodStart, periodEnd, now, currentTerm);
-    const { monthsAhead } = cycle;
-    /*
-     * The part of the month still ahead. It prices the month in progress on the
-     * way in and is the only calendar reading a usage-priced item makes: the
-     * months behind it are gone and the months ahead of it are whole.
-     */
-    const fraction = remainingFraction(cycle, now);
-
-    let credit = 0;
-    let allowance = 0;
-    let used = 0;
-    let unused = 0;
-    let invoicedForCycle = 0;
-    if (from) {
-      const perUnit = from.quotaAllowance ?? 0;
-      if (!perUnit) {
-        throw new BadRequestException(
-          `${from.name} has no allowance, so there is nothing to measure. Set creditBasis to "time" for this add-on.`,
-        );
-      }
-      const listRate = rateOn(from, currentTerm) * fromQuantity;
-      /*
-       * What is being given up is the allowance this account actually holds for
-       * the month in progress, which after a mid-month purchase is smaller than
-       * the price book says — and what it is worth is what was really invoiced
-       * for it, not the list price (MODEL V5 row 8).
-       */
-      const family = from.family ?? from.code;
-      allowance = await this.accounts.quotaCapFor(account, family, perUnit * fromQuantity);
-      invoicedForCycle = await this.accounts.quotaInvoicedFor(account, family, listRate);
-
-      if (opts.quotaUsed === undefined || opts.quotaUsed === null) {
-        throw new BadRequestException(
-          `${from.name} is priced by usage, so the request must say how much of the allowance has been spent: send quotaUsed (0–${allowance}).`,
-        );
-      }
-      used = Math.min(Math.max(0, Math.floor(Number(opts.quotaUsed))), allowance);
-      unused = allowance - used;
-      credit = allowance > 0 ? Math.round((invoicedForCycle * unused) / allowance) : 0;
-      // whole months still ahead were bought outright and never touched
-      credit += listRate * monthsAhead;
-    }
-
-    let charge = 0;
-    let monthsBought = 0;
-    let quotaGranted = 0;
-    let partMonthCharge = 0;
-    if (to) {
-      const perUnit = to.quotaAllowance ?? 0;
-      const rate = rateOn(to, term) * toQuantity;
-      const termChanged = currentTerm !== term;
-      if (termChanged) {
-        /*
-         * A change of term resets the billing anchor, so the new period starts
-         * here rather than part-way through anything: a year bought today runs
-         * a full twelve months from today. There is no month in progress left
-         * to slice, so every month is bought whole and the allowance is granted
-         * in full — the customer pays the list price and gets the list quota.
-         */
-        monthsBought = term === 'yearly' ? 12 : 1;
-        partMonthCharge = 0;
-        charge = rate * monthsBought;
-        quotaGranted = perUnit * toQuantity;
-      } else {
-        /*
-         * Staying on the same term keeps the period the customer is already in.
-         * The month in progress is sold by the slice that is left, price and
-         * allowance cut by the same fraction so the rate per post never depends
-         * on the arrival date (MODEL V5 row 47). Only the months actually left
-         * in the period are bought on top — charging a full eleven from the
-         * middle of a year would bill months already paid for (MODEL V5 row 8).
-         */
-        const wholeMonthsAfter = term === 'yearly' ? monthsAhead : 0;
-        monthsBought = 1 + wholeMonthsAfter;
-        partMonthCharge = Math.round(rate * fraction);
-        charge = partMonthCharge + rate * wholeMonthsAfter;
-        quotaGranted = Math.floor(perUnit * toQuantity * fraction);
-      }
-    }
-
-    const pct = (f: number) => `${(f * 100).toFixed(1)}%`;
-    return {
-      from: from ?? null,
-      to: to ?? null,
-      credit,
-      charge,
-      quotaGranted,
-      workings: {
-        basis: 'usage',
-        currentTerm,
-        term,
-        from: from?.code ?? null,
-        to: to?.code ?? null,
-        fromQuantity,
-        toQuantity,
-        allowance,
-        quotaUsed: used,
-        quotaUnused: unused,
-        invoicedForCycle,
-        monthsAhead,
-        monthsBought,
-        remainingFraction: fraction,
-        quotaGranted,
-        partMonthCharge,
-        creditCents: credit,
-        chargeCents: charge,
-        creditFormula: from
-          ? `${invoicedForCycle} invoiced × ${unused}/${allowance} unspent` +
-            (monthsAhead
-              ? ` + ${rateOn(from, currentTerm) * fromQuantity} × ${monthsAhead} untouched months`
-              : '')
-          : 'nothing given up',
-        chargeFormula: !to
-          ? 'nothing taken'
-          : partMonthCharge
-            ? `${rateOn(to, term)} × ${toQuantity} × ${pct(fraction)} of the month left` +
-              (monthsBought > 1
-                ? ` + ${rateOn(to, term) * toQuantity} × ${monthsBought - 1} whole months`
-                : '')
-            : `${rateOn(to, term)} × ${toQuantity} × ${monthsBought} whole months`,
-        quotaFormula: !to
-          ? 'no allowance taken'
-          : partMonthCharge
-            ? `floor(${to.quotaAllowance ?? 0} × ${toQuantity} × ${pct(fraction)}) = ${quotaGranted}`
-            : `${to.quotaAllowance ?? 0} × ${toQuantity} = ${quotaGranted} in full`,
-      },
-    };
-  }
-
-  private async applyWithUsageSettlement(
-    account: AccountDocument,
-    sub: Stripe.Subscription,
-    desired: DesiredState,
-    maps: CatalogMaps,
-    rule: ChangeRule,
-    ruleKey: ChangeRuleKey,
-    classification: any,
-    quotaUsedInput: number | undefined,
-    usageChange: UsageChange,
-  ) {
-    const quote = await this.quoteUsageSettlement(account, sub, {
-      from: usageChange.from,
-      to: usageChange.to,
-      fromQuantity: usageChange.fromQuantity,
-      toQuantity: usageChange.toQuantity,
-      currentTerm: classification.currentTerm ?? desired.term,
-      term: desired.term,
-      quotaUsed: quotaUsedInput,
-    });
-    const { credit, charge, workings } = quote;
-    const from = quote.from;
-    const to = quote.to!;
-    const allowance = workings.allowance;
-    const used = workings.quotaUsed;
-    const unused = workings.quotaUnused;
-    const currency = this.stripe.currency;
-    const label = !from
-      ? to.name
-      : from.code === to.code
-        ? `${to.name} → ${desired.term} term`
-        : `${from.name} → ${to.name}`;
-
-    /*
-     * One operation should read as one invoice. A change of term already makes
-     * Stripe raise an invoice, and any invoice raised against a subscription
-     * sweeps in that subscription's pending items — so the allowance charge can
-     * ride along with it instead of being billed on its own.
-     *
-     * This moves the charge from "before the subscription changes" to "as the
-     * subscription changes", which is the stronger guarantee of the two: with
-     * error_if_incomplete Stripe refuses the whole update when the card fails,
-     * rather than leaving us to undo a payment we already took. Only the credit
-     * still goes on ahead, so only the credit needs putting back by hand.
-     */
-    const policy = await this.policy.get();
-    const willTermChange = (classification.currentTerm ?? desired.term) !== desired.term;
-    const combineInvoice =
-      policy.invoicing?.combineUsageSettlementInvoice !== false &&
-      willTermChange &&
-      rule.prorationBehavior === 'always_invoice';
-
-    let creditItemId: string | null = null;
-    let invoiceItemId: string | null = null;
-    let invoice: Stripe.Invoice | null = null;
-
-    try {
-      /*
-       * The credit is a line of its own rather than an adjustment to the
-       * customer's balance. Read on the invoice, "Applied balance -10.00" says
-       * nothing about where the money came from; a line sitting next to
-       * Stripe's own "Unused time on ..." says it in the same breath, and the
-       * two ways of giving time and quota back then look alike.
-       */
-      if (credit > 0) {
-        const creditItem = await this.stripe.client.invoiceItems.create({
-          customer: account.stripeCustomerId!,
-          subscription: sub.id,
-          amount: -credit,
-          currency,
-          description: `Unused quota on ${from?.name} — ${unused.toLocaleString()} of ${allowance.toLocaleString()} ${from?.quotaLabel ?? 'units'}`,
-        });
-        creditItemId = creditItem.id;
-      }
-      if (charge > 0) {
-        const item = await this.stripe.client.invoiceItems.create({
-          customer: account.stripeCustomerId!,
-          subscription: sub.id,
-          amount: charge,
-          currency,
-          description: workings.partMonthCharge
-            ? `${to.name} × ${usageChange.toQuantity} — ${quote.quotaGranted} ${to.quotaLabel ?? 'units'} ` +
-              `for the rest of this month` +
-              (workings.monthsBought > 1 ? ` + ${workings.monthsBought - 1} whole months` : '')
-            : `${to.name} × ${usageChange.toQuantity} — ` +
-              (workings.monthsBought > 1
-                ? `${workings.monthsBought} whole months, ${quote.quotaGranted.toLocaleString()} ${to.quotaLabel ?? 'units'} each`
-                : `one whole month, ${quote.quotaGranted.toLocaleString()} ${to.quotaLabel ?? 'units'}`),
-        });
-        invoiceItemId = item.id;
-
-        // Left pending on purpose: the subscription update below raises the
-        // invoice that will carry it, alongside the plan's own proration lines.
-      }
-      if (charge > 0 && !combineInvoice) {
-        // An invoice raised for a subscription always sweeps in that
-        // subscription's pending items, and Stripe rejects the two parameters
-        // together.
-        invoice = await this.stripe.client.invoices.create({
-          customer: account.stripeCustomerId!,
-          subscription: sub.id,
-          auto_advance: false,
-          description: label,
-        });
-        invoice = await this.stripe.client.invoices.finalizeInvoice(invoice.id!);
-        if (invoice.amount_due > 0) {
-          invoice = await this.stripe.client.invoices.pay(invoice.id!);
-        }
-      }
-    } catch (err: any) {
-      // Put the money back exactly as it was before rethrowing.
-      if (invoice && invoice.status !== 'paid') {
-        try {
-          await this.stripe.client.invoices.voidInvoice(invoice.id!);
-        } catch (e: any) {
-          this.logger.warn(`Rollback: could not void ${invoice.id}: ${e.message}`);
-        }
-      } else if (invoiceItemId) {
-        try {
-          await this.stripe.client.invoiceItems.del(invoiceItemId);
-        } catch (e: any) {
-          this.logger.warn(`Rollback: could not delete ${invoiceItemId}: ${e.message}`);
-        }
-      }
-      if (creditItemId) {
-        try {
-          await this.stripe.client.invoiceItems.del(creditItemId);
-        } catch (e: any) {
-          this.logger.warn(`Rollback: could not delete the credit line ${creditItemId}: ${e.message}`);
-        }
-      }
-
-      await this.events.record({
-        accountId: account.id,
-        action: 'subscription.tier_change_failed',
-        ruleKey,
-        summary: `${label} rejected: ${err?.raw?.message ?? err.message}`,
-        policyApplied: rule as any,
-        stripeRequest: workings as any,
-        error: { message: err?.raw?.message ?? err.message, code: err?.raw?.code },
-      });
-      throw new BadRequestException(
-        `Could not collect ${(charge / 100).toFixed(2)} ${currency.toUpperCase()} for ${to.name}: ${err?.raw?.message ?? err.message}. Nothing was changed${from ? ` — the add-on is still ${from.name}` : ''}.`,
-      );
-    }
-
-    /*
-     * The allowance opened for the month in progress, and what was actually
-     * charged for it, are now facts about this purchase rather than about the
-     * price book — a later credit is valued against them (MODEL V5 row 8).
-     */
-    const grantFamily = to.family ?? to.code;
-    await this.accounts.recordQuotaGrant(
-      account,
-      grantFamily,
-      quote.quotaGranted,
-      workings.partMonthCharge,
-    );
-    /*
-     * A fresh allowance means a fresh meter: the posts spent against the old
-     * configuration belong to the allowance that was just settled and credited,
-     * so carrying the reading forward would charge the customer for them twice.
-     */
-    await this.accounts.resetUsage(account, grantFamily, `${label} — new allowance granted`);
-
-    /*
-     * Paid for, so the subscription can move.
-     *
-     * A change of billing term is the awkward case. Resetting the billing cycle
-     * ends the period for the *whole* subscription, and Stripe prices every
-     * line that is attached at that moment — leaving the usage-priced item out
-     * of the items array does not spare it, it only means "do not modify it".
-     * So the line is detached first, the term change happens without it, and it
-     * comes back afterwards at the new price. Its money is already settled, so
-     * none of those three steps involves a payment.
-     */
-    const termChanged = (classification.currentTerm ?? desired.term) !== desired.term;
-    const usageItems = (await this.buildItems(desired, sub, maps)).filter((i) => {
-      const priceId = i.price as string;
-      const mapped = priceId ? maps.byPriceId.get(priceId) : null;
-      return mapped ? maps.addOnItems.get(mapped.code)?.usagePriced : false;
-    });
-    const existingUsageItemId = (sub.items?.data ?? []).find((item) => {
-      const priceId = typeof item.price === 'string' ? item.price : item.price?.id;
-      const mapped = priceId ? maps.byPriceId.get(priceId) : null;
-      return mapped ? maps.addOnItems.get(mapped.code)?.usagePriced : false;
-    })?.id;
-
-    let updated: Stripe.Subscription;
-    try {
-      const metadata = { accountId: account.id, planCode: desired.planCode, term: desired.term };
-
-      if (termChanged && existingUsageItemId) {
-        updated = await this.stripe.call('subscriptions.update (detach usage line)', () =>
-          this.stripe.client.subscriptions.update(sub.id, {
-            items: [{ id: existingUsageItemId, deleted: true }],
-            proration_behavior: 'none',
-          }),
-        );
-        const restItems = await this.buildItems(desired, updated, maps, { excludeUsagePriced: true });
-        updated = await this.stripe.call('subscriptions.update (term)', () =>
-          this.stripe.client.subscriptions.update(sub.id, {
-            items: restItems,
-            proration_behavior: rule.prorationBehavior === 'none' ? 'create_prorations' : rule.prorationBehavior,
-            payment_behavior: rule.paymentBehavior,
-            ...(rule.billingCycleAnchor === 'now' ? { billing_cycle_anchor: 'now' as const } : {}),
-            metadata,
-          }),
-        );
-        const reattach = await this.buildItems(desired, updated, maps);
-        const usageOnly = reattach.filter((i) => {
-          const priceId = i.price as string;
-          const mapped = priceId ? maps.byPriceId.get(priceId) : null;
-          return mapped ? maps.addOnItems.get(mapped.code)?.usagePriced : false;
-        });
-        updated = await this.stripe.call('subscriptions.update (re-attach usage line)', () =>
-          this.stripe.client.subscriptions.update(sub.id, {
-            items: usageOnly,
-            proration_behavior: 'none',
-          }),
-        );
-      } else {
-        updated = await this.stripe.call('subscriptions.update', () =>
-          this.stripe.client.subscriptions.update(sub.id, {
-            items: usageItems,
-            proration_behavior: 'none',
-            metadata,
-          }),
-        );
-
-        // Anything else asked for in the same breath is the ordinary engine's business.
-        const restItems = await this.buildItems(desired, updated, maps, { excludeUsagePriced: true });
-        const needsRest =
-          restItems.some((i) => i.deleted || !i.id) ||
-          classification.changes.some((c: string) => !c.startsWith('add-on ')) ||
-          restItems.some((i) => {
-            const existing = updated.items.data.find((x) => x.id === i.id);
-            const priceId = typeof existing?.price === 'string' ? existing?.price : existing?.price?.id;
-            return existing && (priceId !== i.price || (existing.quantity ?? 0) !== i.quantity);
-          });
-        if (needsRest) {
-          updated = await this.stripe.call('subscriptions.update', () =>
-            this.stripe.client.subscriptions.update(sub.id, {
-              items: restItems,
-              proration_behavior: rule.prorationBehavior === 'none' ? 'create_prorations' : rule.prorationBehavior,
-              payment_behavior: rule.paymentBehavior,
-              ...(rule.billingCycleAnchor === 'now' ? { billing_cycle_anchor: 'now' as const } : {}),
-            }),
-          );
-        }
-      }
-    } catch (err: any) {
-      /*
-       * The charge was riding on this update, so Stripe has already undone it
-       * along with the update itself. The credit went on ahead of it though,
-       * and has to be put back by hand.
-       */
-      if (combineInvoice && invoiceItemId) {
-        try {
-          await this.stripe.client.invoiceItems.del(invoiceItemId);
-        } catch (e: any) {
-          this.logger.warn(`Rollback: could not delete ${invoiceItemId}: ${e.message}`);
-        }
-      }
-      if (combineInvoice && creditItemId) {
-        try {
-          await this.stripe.client.invoiceItems.del(creditItemId);
-        } catch (e: any) {
-          this.logger.warn(`Rollback: could not delete the credit line ${creditItemId}: ${e.message}`);
-        }
-      }
-      await this.events.record({
-        accountId: account.id,
-        action: 'subscription.tier_change_failed',
-        ruleKey,
-        summary: `${label} rejected: ${err?.raw?.message ?? err.message}`,
-        policyApplied: rule as any,
-        error: { message: err?.raw?.message ?? err.message, code: err?.raw?.code },
-      });
-      throw new BadRequestException(
-        `Could not complete ${label}: ${err?.raw?.message ?? err.message}. Nothing was changed.`,
-      );
-    }
-
-    /*
-     * Whether Stripe swept the item in is a prediction, so it gets checked
-     * rather than trusted: an item left pending would wait for the next renewal
-     * to be billed, which is nobody's idea of paying now.
-     */
-    if (combineInvoice && invoiceItemId) {
-      const pending = await this.stripe.client.invoiceItems.retrieve(invoiceItemId);
-      if (!pending.invoice) {
-        invoice = await this.stripe.client.invoices.create({
-          customer: account.stripeCustomerId!,
-          subscription: sub.id,
-          auto_advance: false,
-          description: label,
-        });
-        invoice = await this.stripe.client.invoices.finalizeInvoice(invoice.id!);
-        if (invoice.amount_due > 0) {
-          invoice = await this.stripe.client.invoices.pay(invoice.id!);
-        }
-      }
-    }
-
-    const updateParams = { note: 'see workings', termChanged };
-
-    const summary = this.stripe.summarizeInvoice(invoice ?? ({} as Stripe.Invoice));
-    await this.events.record({
-      accountId: account.id,
-      action: 'subscription.tier_changed',
-      ruleKey,
-      summary: `${label} · credit ${(credit / 100).toFixed(2)}${from ? ` (${unused}/${allowance} unspent)` : ''} · charged ${(charge / 100).toFixed(2)}`,
-      policyApplied: rule as any,
-      stripeRequest: { workings, call: 'subscriptions.update', params: updateParams } as any,
-      result: {
-        creditCents: credit,
-        chargeCents: charge,
-        invoice: invoice ? { id: invoice.id, number: invoice.number, total: invoice.total, amountPaid: invoice.amount_paid, status: invoice.status } : null,
-        balanceAfter: await this.customerBalance(account),
-      },
-    });
-
-    // a fresh allowance was just granted, so the meter starts again
-    const settledFamily = (from ?? to).family;
-    if (settledFamily) await this.accounts.resetUsage(account, settledFamily, `new allowance on ${to.name}`);
-
-    await this.syncAccountFromSubscription(account, updated, maps);
-
-    return {
-      applied: 'usage_settlement',
-      ruleKey,
-      rule,
-      classification,
-      quota: {
-        allowance,
-        used,
-        unused,
-        granted: quote.quotaGranted,
-        label: (from ?? to).quotaLabel ?? null,
-      },
-      creditCents: credit,
-      chargeCents: charge,
-      workings,
-      latestInvoice: invoice ? summary : null,
       state: await this.getState(account.id),
     };
   }
@@ -2523,18 +1597,6 @@ export class SubscriptionsService {
     account.stripeScheduleId = (typeof sub.schedule === 'string' ? sub.schedule : sub.schedule?.id) ?? undefined;
     if (!account.stripeScheduleId) account.pendingChange = undefined;
     account.pauseBehavior = sub.pause_collection?.behavior;
-
-    /*
-     * A grant record describes an allowance the account holds. Once the line is
-     * gone the record would otherwise sit there and mis-price the next purchase
-     * in the same month, so it goes when the licence does.
-     */
-    const heldFamilies = new Set(
-      account.addOns.map((a) => resolved.addOnItems.get(a.code)?.family).filter(Boolean) as string[],
-    );
-    for (const family of Object.keys(account.quotaCap ?? {})) {
-      if (!heldFamilies.has(family)) await this.accounts.clearQuotaGrant(account, family);
-    }
 
     await this.accounts.save(account);
     return account;

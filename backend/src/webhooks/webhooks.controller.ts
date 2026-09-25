@@ -74,6 +74,18 @@ export class WebhooksController {
       case 'invoice.payment_succeeded': {
         const invoice = object as Stripe.Invoice;
         summary = `Invoice ${invoice.number ?? invoice.id} paid — ${invoice.amount_paid / 100} ${invoice.currency.toUpperCase()}`;
+        /*
+         * MODEL V6 row 51: paid coverage — and so the X quota delta — is only
+         * recorded once an invoice is paid. Reconciling replays every paid
+         * invoice, so a retried delivery grants nothing twice.
+         */
+        if (account) {
+          try {
+            await this.subscriptions.getState(account.id);
+          } catch (err: any) {
+            this.logger.warn(`X reconcile after ${invoice.id} failed: ${err.message}`);
+          }
+        }
         break;
       }
 
