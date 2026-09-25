@@ -71,8 +71,8 @@ Chọn preset **`scio_portal_mvp`** (tab Billing policy, hoặc
 | Thao tác | Tiền (Stripe) | Quota (SCIO) |
 |---|---|---|
 | Mua X | prorate tới billing boundary, thu ngay, thẻ hỏng thì không đổi gì | reservation 2.000 trước; paid → grant `floor(2.000 × đã trả / tháng)` |
-| **Huỷ X** | xoá item **ngay**; tháng không hoàn; năm credit từ quotaMonthEnd | FROZEN tới hết quota month, fan-out tắt |
-| Resume X | charge từ `max(now, hết phần đã trả)` | cùng tháng → mở lại ledger cũ; qua tháng → kích hoạt mới |
+| **Huỷ X** | xoá item **ngay**; credit `quotaMonthEnd → xPaidThrough` chỉ khi `quotaMonthEnd < xPaidThrough`, cho cả tháng lẫn năm | FROZEN tới hết quota month, fan-out tắt, FrozenRemaining giữ lại |
+| Mua lại X | không có nút khôi phục; là một lần mua, không thu trùng tới `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)` | trước quotaMonthEnd → khôi phục FrozenRemaining; từ quotaMonthEnd → kích hoạt mới |
 | Đổi term | native cùng gói nền (X ACTIVE) | giữ Used, chỉ cộng delta dương |
 | Huỷ plan | cuối kỳ, không prorate | X ENDED cùng plan |
 
@@ -114,7 +114,7 @@ nhánh trong engine**. X Social không dùng nó: luồng của X do MODEL V6 ch
 - Quota: [`quota-math.ts`](../backend/src/x-addon/quota-math.ts) — thuần hàm,
   replay coverage từ hoá đơn đã paid, quota month cố định theo lịch, true-up gói
   năm. [`x-addon.service.ts`](../backend/src/x-addon/x-addon.service.ts) — trạng
-  thái, ledger, capacity, cancel / resume / trial / trừ quota.
+  thái, ledger, capacity, cancel / mua lại / trial / trừ quota.
 - Reconcile chạy **mỗi lần đọc state** và khi nhận `invoice.paid`, nên webhook
   lỡ chỉ làm grant đến muộn, không bao giờ mất hay trùng.
 
@@ -160,7 +160,7 @@ clock đặt đúng ngày của ví dụ trong model) và `node scripts/test-x-q
 
 | Bẫy | Hậu quả | Cách tránh |
 |---|---|---|
-| Replay coverage sai thứ tự | huỷ rồi resume trong cùng một giây bị đọc thành mất coverage | sắp theo `created` rồi số hoá đơn; trong một hoá đơn dòng âm trước, dòng dương sau |
+| Replay coverage sai thứ tự | huỷ rồi mua lại trong cùng một giây bị đọc thành mất coverage | sắp theo `created` rồi số hoá đơn; trong một hoá đơn dòng âm trước, dòng dương sau |
 | Đọc thời gian bằng đồng hồ máy | account có test clock bị tính sai prorate | mọi lần đọc giờ đi qua `stripe.nowFor(testClockId)` |
 | Nuốt lỗi khi đọc subscription | tạo trùng subscription thứ hai | chỉ `resource_missing`/404 mới coi là "không có"; lỗi khác phải ném |
 | `create_prorations` thì balance không đổi | tưởng credit không được cấp | đo bằng chênh lệch dòng proration giữa hai lần preview, với `proration_date` ghim cố định |

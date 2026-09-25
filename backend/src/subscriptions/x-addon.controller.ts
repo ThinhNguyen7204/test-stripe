@@ -5,8 +5,10 @@ import { SyncKind } from '../x-addon/x-addon.service';
 /**
  * The X add-on's own lifecycle (MODEL V6). Buying it and cancelling it also
  * work through /subscriptions/:id/change by adding or dropping `x_social`;
- * these routes are the direct handles, plus what only the add-on has — resume,
- * the trial, and the quota a provider fetch spends.
+ * these routes are the direct handles, plus what only the add-on has — the
+ * trial and the quota a provider fetch spends. There is no resume route: after a
+ * Cancel the user buys X again, and purchase restores FrozenRemaining where the
+ * quota month has not ended (MODEL V6 row 59).
  */
 @Controller('x-addon')
 export class XAddonController {
@@ -18,18 +20,13 @@ export class XAddonController {
   }
 
   @Post(':accountId/preview/:action')
-  preview(@Param('accountId') accountId: string, @Param('action') action: 'purchase' | 'cancel' | 'resume') {
+  preview(@Param('accountId') accountId: string, @Param('action') action: 'purchase' | 'cancel') {
     return this.subscriptions.previewX(accountId, action);
   }
 
   @Post(':accountId/cancel')
   cancel(@Param('accountId') accountId: string) {
     return this.subscriptions.cancelX(accountId);
-  }
-
-  @Post(':accountId/resume')
-  resume(@Param('accountId') accountId: string) {
-    return this.subscriptions.resumeX(accountId);
   }
 
   @Post(':accountId/trial')

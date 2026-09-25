@@ -47,10 +47,9 @@ export const api = {
   renewalPreview: (id: string) => request<any>(`/subscriptions/${id}/renewal-preview`),
 
   // the X add-on, MODEL V6
-  xPreview: (id: string, action: 'purchase' | 'cancel' | 'resume') =>
+  xPreview: (id: string, action: 'purchase' | 'cancel') =>
     request<any>(`/x-addon/${id}/preview/${action}`, { method: 'POST' }),
   xCancel: (id: string) => request<any>(`/x-addon/${id}/cancel`, { method: 'POST' }),
-  xResume: (id: string) => request<any>(`/x-addon/${id}/resume`, { method: 'POST' }),
   xTrial: (id: string) => request<any>(`/x-addon/${id}/trial`, { method: 'POST' }),
   xSyncRun: (id: string, body: { kind: string; requested?: number; returned: number; actionId?: string }) =>
     request<any>(`/x-addon/${id}/sync-runs`, { method: 'POST', body: JSON.stringify(body) }),

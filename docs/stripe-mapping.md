@@ -193,9 +193,9 @@ cứng tham số của ba thao tác (code: `backend/src/x-addon/x-addon.service.
 | Thao tác | `subscriptions.update` |
 |---|---|
 | Mua | `items: [{price, quantity: 1}]`, `proration_behavior: always_invoice`, `proration_date: now`, `payment_behavior: error_if_incomplete` |
-| Huỷ — Monthly | `items: [{id, deleted: true}]`, `proration_behavior: none` |
-| Huỷ — Yearly | `items: [{id, deleted: true}]`, `proration_behavior: always_invoice`, **`proration_date: quotaMonthEnd`** |
-| Resume | `items: [{price, quantity: 1}]`; nếu `max(now, hết phần đã trả)` < cuối kỳ thì `always_invoice` + `proration_date` = mốc đó + `error_if_incomplete`, ngược lại `none` |
+| Huỷ, `quotaMonthEnd < xPaidThrough` (tháng hoặc năm) | `items: [{id, deleted: true}]`, `proration_behavior: always_invoice`, **`proration_date: quotaMonthEnd`** — credit `quotaMonthEnd → xPaidThrough` |
+| Huỷ, `quotaMonthEnd ≥ xPaidThrough` | `items: [{id, deleted: true}]`, `proration_behavior: none` — không có coverage tương lai để credit |
+| Mua lại X | như Mua, nhưng `proration_date = max(now, hết phần đã trả)` — trước quotaMonthEnd đó chính là `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)`; nếu mốc đó ≥ cuối kỳ thì `proration_behavior: none` |
 | Đổi interval | không có luật riêng: item X đổi price cùng gói nền theo rule `termToYearly` / `termToMonthly` |
 
 Đo được trên test mode (X năm $216 mua 05/09/2026, huỷ 20/09):
@@ -204,7 +204,7 @@ cứng tham số của ba thao tác (code: `backend/src/x-addon/x-addon.service.
   kỳ hiện tại: hoá đơn huỷ có đúng một dòng `−$200.61` kỳ `2026-10-01 →
   2027-09-05`, tự `paid`, ghi vào customer balance. Việc xoá item thì vẫn xảy ra
   **ngay**.
-- Resume với cùng `proration_date` tạo dòng `+$200.61` đúng kỳ đó; hoá đơn trả
+- Mua lại X với cùng `proration_date` tạo dòng `+$200.61` đúng kỳ đó; hoá đơn trả
   bằng balance nên `amount_due = $0`.
 
 **Quota không đọc từ Stripe mà suy ra từ Stripe**: SCIO replay các dòng X trên

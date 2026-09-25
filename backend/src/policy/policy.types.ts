@@ -82,7 +82,7 @@ export interface ChangeRule {
  * Per-add-on overrides, keyed by the add-on's code. They layer on top of the
  * global rules, so one add-on can behave differently from the others without
  * forking the engine. (The X add-on does not use them: MODEL V6 fixes its
- * purchase, cancel and resume flows, see x-addon/x-addon.service.ts.)
+ * purchase, cancel and buy-again flows, see x-addon/x-addon.service.ts.)
  */
 export interface AddOnRuleSet {
   add?: Partial<ChangeRule>;
@@ -157,7 +157,7 @@ export interface ConstraintPolicy {
   /**
    * X admission control, MODEL V6 row 17. Every tenant admitted to the X
    * add-on reserves one full quota month (2,000 Post Updates) before it is
-   * charged; a purchase or a resume is refused when
+   * charged; a purchase, including buying X again, is refused when
    * `CommercialCommitted + PendingReservations + 2,000 > xCommercialCeilingUnits`.
    * The gap up to `xProviderHardCapUnits` is the operational buffer that is
    * never sold. An interval change reserves nothing more.

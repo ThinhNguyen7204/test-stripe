@@ -7,10 +7,10 @@ export type AccountDocument = HydratedDocument<Account>;
 export interface XAddonAccountState {
   /** when the add-on was cancelled, in the customer's clock */
   cancelledAt?: number;
-  /** end of the quota month it was cancelled in — Resume before this reuses the ledger */
+  /** end of the quota month it was cancelled in — buying X again before this restores FrozenRemaining */
   frozenUntil?: number;
   cancelTerm?: BillingTerm;
-  lastResumedAt?: number;
+  lastRepurchasedAt?: number;
   /** last status reported, so a change of status is logged once */
   lastStatus?: string;
   quantityAlert?: string;

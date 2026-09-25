@@ -127,14 +127,29 @@ export default function XAddonPanel({ accountId, state, run, busy }: any) {
             Cancel X
           </button>
         )}
-        {x.resume && (
+        {x.repurchase && (
           <button
             className="ghost small"
             disabled={busy}
-            onClick={() => run(() => api.xResume(accountId), 'X add-on resumed')}
-            title={x.resume.kind === 'same_quota_month' ? 'Reopens the same ledger' : 'New activation — the old quota expired'}
+            onClick={() =>
+              run(
+                () =>
+                  api.change(accountId, {
+                    planCode: state.current.planCode,
+                    term: state.current.term,
+                    screens: state.current.screens,
+                    addOns: [...(state.current.addOns ?? []), { code: 'x_social', quantity: 1 }],
+                  }),
+                'X bought again',
+              )
+            }
+            title={
+              x.repurchase.kind === 'restores_frozen_remaining'
+                ? 'Restores FrozenRemaining until quota month end'
+                : 'New activation — the old quota expired'
+            }
           >
-            Resume X {x.resume.kind === 'same_quota_month' ? '(same quota month)' : '(new activation)'}
+            Buy X again {x.repurchase.kind === 'restores_frozen_remaining' ? '(restores frozen quota)' : '(new activation)'}
           </button>
         )}
         {x.trialAvailable && (
@@ -143,11 +158,14 @@ export default function XAddonPanel({ accountId, state, run, busy }: any) {
           </button>
         )}
       </div>
-      {x.resume && (
+      {x.repurchase && (
         <p className="hint">
-          {x.resume.prorationBehavior === 'none'
-            ? 'Resume charges nothing now — this time is already paid.'
-            : `Resume charges from ${day(x.resume.chargesFrom)} to ${day(x.resume.chargesTo)}.`}
+          {x.repurchase.kind === 'restores_frozen_remaining'
+            ? `There is no separate restore. Buying X again before ${day(x.quotaMonth?.end)} restores the frozen Remaining, which still expires then. `
+            : 'The quota month it was cancelled in is over — buying X again is a new activation. '}
+          {x.repurchase.prorationBehavior === 'none'
+            ? 'Nothing is charged now: this time is already paid.'
+            : `Stripe charges from ${day(x.repurchase.chargesFrom)} to ${day(x.repurchase.chargesTo)}.`}
         </p>
       )}
 

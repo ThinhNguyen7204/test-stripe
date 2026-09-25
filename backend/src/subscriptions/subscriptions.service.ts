@@ -164,7 +164,7 @@ export class SubscriptionsService {
   }
 
   /*
-   * MODEL V6 fixes how the X add-on is bought, cancelled and resumed (rows 49,
+   * MODEL V6 fixes how the X add-on is bought, cancelled and bought again (rows 49,
    * 51, 59): each has its own proration boundary, a capacity reservation and a
    * paid gate. Folding one of them into an unrelated change would put the X
    * item under that change's proration rule instead, so they travel alone.
@@ -193,19 +193,10 @@ export class SubscriptionsService {
     return { applied: 'x_cancel', state: await this.getState(accountId) };
   }
 
-  async resumeX(accountId: string) {
-    const account = await this.accounts.get(accountId);
-    const { maps, ctx } = await this.liveContext(account);
-    const updated = await this.xAddon.resume(account, ctx);
-    await this.syncAccountFromSubscription(account, updated, maps);
-    return { applied: 'x_resume', state: await this.getState(accountId) };
-  }
-
-  async previewX(accountId: string, action: 'purchase' | 'cancel' | 'resume') {
+  async previewX(accountId: string, action: 'purchase' | 'cancel') {
     const account = await this.accounts.get(accountId);
     const { ctx } = await this.liveContext(account);
     if (action === 'cancel') return this.xAddon.previewCancel(account, ctx);
-    if (action === 'resume') return this.xAddon.previewResume(account, ctx);
     return this.xAddon.previewPurchase(account, ctx);
   }
 

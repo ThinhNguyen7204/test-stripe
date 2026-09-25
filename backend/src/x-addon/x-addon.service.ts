@@ -45,9 +45,9 @@ import {
  * ACTIVE           item on a paid base plan and now is inside paid coverage
  * PAYMENT_PENDING  item present but the time it needs is not paid (yet)
  * FROZEN           cancelled; the quota month it was cancelled in has not ended,
- *                  so Resume reopens the same ledger (row 59)
- * CANCELED         cancelled and that quota month is over: Resume is a new
- *                  activation and the old quota has expired
+ *                  so buying X again restores FrozenRemaining (row 59)
+ * CANCELED         cancelled and that quota month is over: buying X again is a
+ *                  new activation and the old quota has expired
  * ENDED            the base subscription it rode on is gone (row 55)
  */
 export type XStatus = 'NONE' | 'TRIALING' | 'ACTIVE' | 'PAYMENT_PENDING' | 'FROZEN' | 'CANCELED' | 'ENDED';
@@ -350,7 +350,7 @@ export class XAddonService {
     } else if (['NONE', 'CANCELED', 'ENDED'].includes(status)) {
       /*
        * Only a commitment is given back here. A pending reservation belongs to
-       * a purchase or resume that is talking to Stripe right now — a read
+       * a purchase that is talking to Stripe right now — a read
        * landing in between must not free the slot under it; it expires on its
        * own after 15 minutes if that call never finishes.
        */
@@ -399,13 +399,13 @@ export class XAddonService {
     }
     if (status === 'FROZEN') {
       warnings.push(
-        `Cancelled and frozen until ${this.day(account.xAddon!.frozenUntil!)}. Resuming before then reopens this quota month with Used and Remaining as they were.`,
+        `Cancelled and frozen until ${this.day(account.xAddon!.frozenUntil!)}. There is no separate restore: buying X again before then restores FrozenRemaining, which still expires on ${this.day(account.xAddon!.frozenUntil!)}.`,
       );
     }
 
-    const resume =
+    const repurchase =
       (status === 'FROZEN' || status === 'CANCELED') && ctx.sub && PAID_STATUSES.includes(ctx.sub.status)
-        ? this.resumePlan(now, coverage, ctx, status)
+        ? this.repurchasePlan(now, coverage, ctx, status)
         : null;
 
     return {
@@ -448,7 +448,8 @@ export class XAddonService {
       /** row 49: cancel switches the tenant's fan-out off at once */
       fanOut: status === 'ACTIVE' || trialLive,
       manualOnly: trialLive,
-      resume,
+      /** what buying X again would do — there is no separate restore action (row 59) */
+      repurchase,
       quantityAlert: account.xAddon?.quantityAlert ?? null,
       capacity: await this.capacity(account.id),
       warnings,
@@ -456,19 +457,25 @@ export class XAddonService {
   }
 
   /**
-   * Where a re-added item has to start charging: never before now, and never
-   * before the end of what is already paid — a monthly cancellation hands no
-   * money back, so charging that stretch again would bill it twice; a yearly
-   * one was credited from quotaMonthEnd, so that is exactly where the debit
-   * starts again (row 59, V6 EASY 1).
+   * Buying X again after a Cancel (row 59, V6 EASY 1). Before quotaMonthEnd it
+   * restores FrozenRemaining and SHALL NOT charge again up to
+   * `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)`; where Cancel
+   * credited the future coverage, that credit is debited back from the same
+   * boundary. From quotaMonthEnd on it is a new activation.
+   *
+   * Paid coverage already encodes both halves: a Cancel that credited from
+   * quotaMonthEnd has cut coverage there, and one that could not credit left it
+   * at oldPaidThrough. So `max(now, end of paid coverage)` IS AlreadyPaidUntil
+   * before the boundary, and `now` after it.
    */
-  private resumePlan(now: number, coverage: Interval[], ctx: XSubscriptionContext, status: XStatus) {
+  private repurchasePlan(now: number, coverage: Interval[], ctx: XSubscriptionContext, status: XStatus) {
     const paidEnd = coverageEnd(coverage) ?? now;
     const prorationDate = Math.max(now, paidEnd);
     const periodEnd = ctx.periodEnd ?? prorationDate;
     const chargeNow = prorationDate < periodEnd;
     return {
-      kind: status === 'FROZEN' ? ('same_quota_month' as const) : ('new_activation' as const),
+      kind: status === 'FROZEN' ? ('restores_frozen_remaining' as const) : ('new_activation' as const),
+      alreadyPaidUntil: status === 'FROZEN' ? prorationDate : null,
       prorationDate,
       prorationBehavior: chargeNow ? ('always_invoice' as const) : ('none' as const),
       chargesFrom: chargeNow ? prorationDate : null,
@@ -482,7 +489,7 @@ export class XAddonService {
   async previewPurchase(account: AccountDocument, ctx: XSubscriptionContext) {
     this.assertBasePaid(ctx);
     const snap = await this.snapshot(account, ctx);
-    if (snap.status === 'FROZEN' || snap.status === 'CANCELED') return this.previewResume(account, ctx, snap);
+    if (snap.status === 'FROZEN' || snap.status === 'CANCELED') return this.previewRepurchase(account, ctx, snap);
     const priceId = await this.catalog.priceIdFor(X_ADDON_CODE, ctx.term);
     const now = snap.now;
     const params = {
@@ -512,7 +519,7 @@ export class XAddonService {
   async previewCancel(account: AccountDocument, ctx: XSubscriptionContext) {
     const snap = await this.snapshot(account, ctx);
     if (!snap.itemId) throw new BadRequestException('There is no X add-on on this subscription to cancel.');
-    const plan = this.cancelPlan(snap.now, ctx, snap.itemId);
+    const plan = this.cancelPlan(snap.now, ctx, snap.itemId, snap.paidThrough);
     const invoice = plan.params.proration_behavior === 'always_invoice' ? await this.previewInvoice(account, ctx.sub!, plan.params) : null;
     return {
       mode: 'x_cancel',
@@ -525,24 +532,24 @@ export class XAddonService {
     };
   }
 
-  async previewResume(account: AccountDocument, ctx: XSubscriptionContext, known?: Awaited<ReturnType<XAddonService['snapshot']>>) {
-    this.assertBasePaid(ctx);
-    const snap = known ?? (await this.snapshot(account, ctx));
-    if (!snap.resume) throw new BadRequestException(`Nothing to resume — the X add-on is ${snap.status}.`);
-    const params = await this.resumeParams(snap.resume, ctx.term);
+  private async previewRepurchase(account: AccountDocument, ctx: XSubscriptionContext, snap: Awaited<ReturnType<XAddonService['snapshot']>>) {
+    const plan = snap.repurchase!;
+    const params = await this.repurchaseParams(plan, ctx.term);
     const invoice = params.proration_behavior === 'always_invoice' ? await this.previewInvoice(account, ctx.sub!, params) : null;
-    const added = snap.resume.chargesFrom && snap.resume.chargesTo ? { start: snap.resume.chargesFrom, end: snap.resume.chargesTo } : null;
+    const added = plan.chargesFrom && plan.chargesTo ? { start: plan.chargesFrom, end: plan.chargesTo } : null;
     const quota = await this.quotaProjection(account, snap, added);
     return {
-      mode: 'x_resume',
+      mode: 'x_repurchase',
       explanation: [
-        snap.resume.kind === 'same_quota_month'
-          ? `Resume inside the quota month it was cancelled in: the same ledger reopens with Granted ${snap.ledger?.granted ?? 0} / Used ${snap.ledger?.used ?? 0} — nothing is reset or granted again (row 59).`
-          : `The quota month it was cancelled in is over, so this is a new activation: the old quota has expired and this month is granted by paid coverage.`,
-        snap.resume.prorationBehavior === 'none'
-          ? `Time is already paid up to ${this.day(snap.resume.prorationDate)}, the end of this billing period — the item goes back with proration_behavior=none and nothing is charged twice. Stripe bills it again at renewal.`
-          : `Stripe charges from ${this.day(snap.resume.prorationDate)} (proration_date) to ${this.day(snap.resume.chargesTo)}, never a stretch already paid for${snap.term === 'yearly' ? ' — the same boundary the yearly credit was issued from' : ''}.`,
-        'The ledger and the fan-out unfreeze only after payment succeeds; a declined card leaves the add-on frozen.',
+        plan.kind === 'restores_frozen_remaining'
+          ? `Buying X again before quotaMonthEnd ${this.day(snap.quotaMonth.end)}: FrozenRemaining is restored — Granted ${snap.ledger?.granted ?? 0} / Used ${snap.ledger?.used ?? 0} — and still expires on ${this.day(snap.quotaMonth.end)}. Nothing is reset or granted again (row 59).`
+          : `The quota month it was cancelled in is over, so buying X again is a new activation: the old quota has expired and this month is granted by paid coverage.`,
+        plan.prorationBehavior === 'none'
+          ? `Already paid until ${this.day(plan.prorationDate)}, the end of this billing period — the item goes back with proration_behavior=none and nothing is charged twice. Stripe bills it again at renewal.`
+          : `Stripe charges from ${this.day(plan.prorationDate)} (proration_date) to ${this.day(plan.chargesTo)}${
+              plan.kind === 'restores_frozen_remaining' ? ' — never the stretch up to AlreadyPaidUntil, and exactly the future coverage Cancel credited, if it did' : ''
+            }.`,
+        'FrozenRemaining and the fan-out open only after payment succeeds; a declined card leaves the add-on frozen.',
         'A capacity reservation is taken again before Stripe is called.',
       ],
       capacity: snap.capacity,
@@ -615,7 +622,7 @@ export class XAddonService {
     if (snap.status === 'ACTIVE' || snap.status === 'PAYMENT_PENDING') {
       throw new BadRequestException('The X add-on is already on this subscription — one per tenant, quantity 1 (row 4).');
     }
-    if (snap.status === 'FROZEN' || snap.status === 'CANCELED') return this.resume(account, ctx);
+    if (snap.status === 'FROZEN' || snap.status === 'CANCELED') return this.repurchase(account, ctx, snap);
 
     const priceId = await this.catalog.priceIdFor(X_ADDON_CODE, ctx.term);
     const params: Stripe.SubscriptionUpdateParams = {
@@ -656,11 +663,17 @@ export class XAddonService {
     return updated;
   }
 
-  private cancelPlan(now: number, ctx: XSubscriptionContext, itemId: string) {
+  /**
+   * Row 49 / row 7, identical for Monthly and Yearly: credit only the paid
+   * coverage SCIO has not yet turned into quota — `quotaMonthEnd →
+   * xPaidThrough` — and only where that stretch exists. The quota month in
+   * progress funded GrantedTarget and is never credited.
+   */
+  private cancelPlan(now: number, ctx: XSubscriptionContext, itemId: string, paidThrough: number | null) {
     const q = quotaMonthOf(now);
-    const periodEnd = ctx.periodEnd ?? q.end;
-    const yearlyCredit = ctx.term === 'yearly' && q.end < periodEnd;
-    const params: Stripe.SubscriptionUpdateParams = yearlyCredit
+    const xPaidThrough = Math.min(paidThrough ?? ctx.periodEnd ?? q.end, ctx.periodEnd ?? Number.MAX_SAFE_INTEGER);
+    const credit = q.end < xPaidThrough;
+    const params: Stripe.SubscriptionUpdateParams = credit
       ? { items: [{ id: itemId, deleted: true }], proration_behavior: 'always_invoice', proration_date: q.end }
       : { items: [{ id: itemId, deleted: true }], proration_behavior: 'none' };
     return {
@@ -668,12 +681,10 @@ export class XAddonService {
       params,
       explanation: [
         'Cancel takes effect now (row 49): the X item is deleted from the subscription, the tenant is FROZEN and its fan-out switched off. The base plan is untouched.',
-        yearlyCredit
-          ? `Yearly: proration_date = quotaMonthEnd ${this.day(q.end)}, so Stripe credits the unused coverage ${this.day(q.end)} → ${this.day(periodEnd)} to the customer balance. The quota month in progress stays paid.`
-          : ctx.term === 'yearly'
-            ? 'Yearly, but the paid year ends inside this quota month — there is no coverage after quotaMonthEnd to credit.'
-            : 'Monthly: proration_behavior=none — no automatic refund.',
-        `Granted, Used and Remaining are kept FROZEN until ${this.day(q.end)}; resuming before then continues with them, after it they expire.`,
+        credit
+          ? `quotaMonthEnd ${this.day(q.end)} is before xPaidThrough ${this.day(xPaidThrough)}: proration_date = quotaMonthEnd, so Stripe credits ${this.day(q.end)} → ${this.day(xPaidThrough)} to the customer balance. The quota month in progress funded GrantedTarget and is not credited.`
+          : `quotaMonthEnd ${this.day(q.end)} is not before xPaidThrough ${this.day(xPaidThrough)}: there is no future paid coverage SCIO has not granted, so the item is deleted with proration_behavior=none and no credit.`,
+        `FrozenRemaining is kept until ${this.day(q.end)}. There is no separate restore: buying X again before then restores it, after it it has expired.`,
         'The capacity reservation is released.',
       ],
     };
@@ -687,8 +698,9 @@ export class XAddonService {
     const prices = await this.prices();
     const item = this.xItemOf(ctx.sub, prices);
     if (!item) throw new BadRequestException('There is no X add-on on this subscription to cancel.');
-    const now = await this.stripe.nowFor(account.testClockId);
-    const plan = this.cancelPlan(now, ctx, item.id);
+    const snap = await this.snapshot(account, ctx);
+    const now = snap.now;
+    const plan = this.cancelPlan(now, ctx, item.id, snap.paidThrough);
     const balanceBefore = await this.balance(account);
 
     const updated = await this.stripe.call('subscriptions.update (cancel X)', () =>
@@ -710,7 +722,7 @@ export class XAddonService {
       accountId: account.id,
       action: 'x.cancelled',
       summary: `X add-on cancelled — FROZEN until ${this.day(plan.q.end)}, fan-out off. ${
-        credit > 0 ? `Yearly credit ${(credit / 100).toFixed(2)} to the customer balance.` : 'No refund.'
+        credit > 0 ? `Credit ${(credit / 100).toFixed(2)} for ${this.day(plan.q.end)} onwards to the customer balance.` : 'No credit — no future paid coverage.'
       }`,
       stripeRequest: plan.params as any,
       result: { creditCents: credit, frozenUntil: plan.q.end },
@@ -718,8 +730,8 @@ export class XAddonService {
     return updated;
   }
 
-  private async resumeParams(
-    plan: NonNullable<ReturnType<XAddonService['resumePlan']>>,
+  private async repurchaseParams(
+    plan: NonNullable<ReturnType<XAddonService['repurchasePlan']>>,
     term: BillingTerm,
   ): Promise<Stripe.SubscriptionUpdateParams> {
     const priceId = await this.catalog.priceIdFor(X_ADDON_CODE, term);
@@ -733,24 +745,28 @@ export class XAddonService {
         };
   }
 
-  async resume(account: AccountDocument, ctx: XSubscriptionContext): Promise<Stripe.Subscription> {
-    this.assertBasePaid(ctx);
-    const snap = await this.snapshot(account, ctx);
-    if (!snap.resume) throw new BadRequestException(`Nothing to resume — the X add-on is ${snap.status}.`);
-    const params = { ...(await this.resumeParams(snap.resume, ctx.term)), expand: ['latest_invoice'] };
+  /** Buying X again after a Cancel — reached through purchase(), never on its own (row 59). */
+  private async repurchase(
+    account: AccountDocument,
+    ctx: XSubscriptionContext,
+    snap: Awaited<ReturnType<XAddonService['snapshot']>>,
+  ): Promise<Stripe.Subscription> {
+    const plan = snap.repurchase;
+    if (!plan) throw new BadRequestException(`X cannot be bought again from ${snap.status}.`);
+    const params = { ...(await this.repurchaseParams(plan, ctx.term)), expand: ['latest_invoice'] };
 
     await this.reserve(account.id);
     let updated: Stripe.Subscription;
     try {
-      updated = await this.stripe.call('subscriptions.update (resume X)', () =>
+      updated = await this.stripe.call('subscriptions.update (buy X again)', () =>
         this.stripe.client.subscriptions.update(ctx.sub!.id, params),
       );
     } catch (err) {
       await this.release(account.id);
       await this.events.record({
         accountId: account.id,
-        action: 'x.resume_failed',
-        summary: `Resume refused — ${(err as any)?.response?.message ?? (err as Error).message}. Still ${snap.status}; nothing unfrozen.`,
+        action: 'x.repurchase_failed',
+        summary: `Buying X again refused — ${(err as any)?.response?.message ?? (err as Error).message}. Still ${snap.status}; nothing restored.`,
         stripeRequest: params as any,
       });
       throw err;
@@ -764,21 +780,21 @@ export class XAddonService {
       cancelledAt: undefined,
       frozenUntil: undefined,
       cancelTerm: undefined,
-      lastResumedAt: snap.now,
+      lastRepurchasedAt: snap.now,
     };
     account.markModified('xAddon');
     await this.accounts.save(account);
 
     await this.events.record({
       accountId: account.id,
-      action: 'x.resumed',
-      summary: `X add-on resumed (${snap.resume.kind === 'same_quota_month' ? 'same quota month — ledger reopened as it was' : 'new activation'}) — ${
+      action: 'x.repurchased',
+      summary: `X bought again (${plan.kind === 'restores_frozen_remaining' ? 'before quotaMonthEnd — FrozenRemaining restored' : 'new activation'}) — ${
         params.proration_behavior === 'none'
           ? 'already paid, nothing charged'
-          : `charged from ${this.day(snap.resume.prorationDate)}: ${invoice?.number ?? invoice?.id} ${((invoice?.total ?? 0) / 100).toFixed(2)}`
+          : `charged from ${this.day(plan.prorationDate)}: ${invoice?.number ?? invoice?.id} ${((invoice?.total ?? 0) / 100).toFixed(2)}`
       }`,
       stripeRequest: params as any,
-      result: { invoice: invoice ? this.stripe.summarizeInvoice(invoice) : null, plan: snap.resume },
+      result: { invoice: invoice ? this.stripe.summarizeInvoice(invoice) : null, plan },
     });
     return updated;
   }

@@ -24,7 +24,7 @@ nào chỉnh trong app, chỗ nào phải vào dashboard Stripe.
 > | Standard plan | Pro Plus, Engage |
 > | X Social (một add-on, quantity 1) | Background Music, Video Wall, Wireless Presentation |
 > | Chu kỳ tháng ⇄ năm | Thêm / bớt màn hình |
-> | Mua, huỷ, resume X, trial X | Lên / hạ gói ở mức plan |
+> | Mua, huỷ, mua lại X, trial X | Lên / hạ gói ở mức plan |
 
 ---
 
@@ -68,7 +68,7 @@ Hai hệ quả:
 ## 3. Khách bớt đi — **không cho giữa kỳ**
 
 > **MVP:** luật chặn này không chạm tới X: **huỷ X** là luồng riêng của MODEL V6
-> (mục 10) — xoá item ngay, gói tháng không hoàn, gói năm credit từ quotaMonthEnd.
+> (mục 10) — xoá item ngay, và chỉ credit phần đã trả nằm sau quotaMonthEnd, nếu có.
 > Hạ gói ở mức plan và bớt màn hình đều không tồn tại trong MVP. Cửa chặn giữ lại
 > cho giai đoạn sau khi portal mở thêm bậc.
 
@@ -228,8 +228,8 @@ Standard/Pro và không còn quantity (V6 row 48).
 |---|---|---|
 | Mua | prorate tới billing boundary, thu ngay; thẻ hỏng → không có gì | reservation 2.000 trước khi gọi Stripe; paid → commit + grant |
 | Renewal | thu kỳ mới | cộng delta còn thiếu vào cùng ledger |
-| Huỷ X | xoá item ngay; tháng: không hoàn; năm: credit từ quotaMonthEnd vào balance | FROZEN tới hết quota month, tắt fan-out, trả reservation |
-| Resume | re-add, charge từ `max(now, hết phần đã trả)` | cùng quota month → mở lại đúng ledger; qua tháng → kích hoạt mới |
+| Huỷ X | xoá item ngay; nếu `quotaMonthEnd < xPaidThrough` thì credit `quotaMonthEnd → xPaidThrough` vào balance, ngược lại không credit — như nhau cho tháng và năm | FROZEN tới hết quota month, tắt fan-out, trả reservation, giữ FrozenRemaining |
+| Mua lại X | không có nút khôi phục; re-add như một lần mua, không thu trùng tới `min(oldPaidThrough, quotaMonthEnd)`, debit lại phần đã credit | trước quotaMonthEnd → khôi phục FrozenRemaining; từ quotaMonthEnd → kích hoạt mới |
 | Đổi interval | native cùng gói nền (chỉ khi X ACTIVE) | giữ Used, delta dương nếu có |
 | Gói nền về Free / kết thúc | cuối kỳ gói nền | X ENDED cùng gói nền |
 | Payment fail | không có coverage mới | qua paidThrough thì dừng fetch; trả được thì cộng delta |
@@ -243,7 +243,7 @@ không gọi provider, không tính overage.
 ### Mô phỏng trong demo
 
 Khối **X add-on** ở cột trái: status, quota month, Granted / Used / Remaining,
-paidThrough, capacity, các nút *Cancel X* / *Resume X* / *Start 14-day trial*, và
+paidThrough, capacity, các nút *Cancel X* / *Buy X again* / *Start 14-day trial*, và
 ô **Provider fetch** (chọn Initial/Auto/Manual, nhập *asked* và *returned*) đóng
 vai X API. API: `/api/x-addon/:id` và `/api/x-addon/:id/sync-runs`.
 
@@ -269,7 +269,7 @@ chuyển thành `custom`.
 | Năm → Tháng | immediate | `always_invoice` | **now** | `error_if_incomplete` | `push_to_account_balance` |
 
 Ngoài các luật chung, còn một tầng **override theo từng add-on** (`addOnRules`,
-theo code của add-on). X Social **không** dùng tầng này: mua, huỷ và resume của
+theo code của add-on). X Social **không** dùng tầng này: mua, huỷ và mua lại của
 nó do MODEL V6 chốt cứng trong `backend/src/x-addon/x-addon.service.ts`.
 
 **Bốn cách xử lý khi thay đổi sinh ra khoản phải trả lại khách:**

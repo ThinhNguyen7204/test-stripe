@@ -194,8 +194,8 @@ export default function SubscriptionPanel({ accountId, catalog, state, run, busy
             {(xStatus === 'FROZEN' || xStatus === 'CANCELED') && (
               <p className="hint">
                 {xStatus === 'FROZEN'
-                  ? `Cancelled — frozen until ${day(state.xAddon.frozen?.until)}. Turning it on resumes the same quota month.`
-                  : 'Cancelled and its quota month is over — turning it on is a new activation.'}
+                  ? `Cancelled — frozen until ${day(state.xAddon.frozen?.until)}. Turning it on buys X again and restores the frozen Remaining, which still expires then.`
+                  : 'Cancelled and its quota month is over — turning it on buys X again as a new activation.'}
               </p>
             )}
             <p className="hint">Add or cancel it on its own: it has its own proration boundary and paid gate.</p>

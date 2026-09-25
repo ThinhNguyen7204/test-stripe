@@ -58,7 +58,7 @@ Remaining        = max(0, Granted − Used)
    X. X được thêm vào **subscription đã có**, không gộp vào lúc tạo subscription
    mới (row 51).
 2. **X bám interval của gói nền.** Không có trạng thái plan tháng + X năm.
-3. **Mua / huỷ / resume X đi riêng**, không gộp với thay đổi khác — mỗi thao tác
+3. **Mua / huỷ / mua lại X đi riêng**, không gộp với thay đổi khác — mỗi thao tác
    có mốc proration, reservation và cổng thanh toán riêng.
 4. **Capacity** (row 17): trước khi gọi Stripe, tenant giữ một reservation 2.000
    (TTL 15 phút). Chỉ bán khi `Committed + Pending + 2.000 ≤ 2.500.000`; paid thì
@@ -112,30 +112,54 @@ reservation được trả lại. Quota chỉ mở **sau khi hoá đơn paid**.
 ## 7. Huỷ X — có hiệu lực ngay
 
 Xoá X item khỏi subscription **ngay**, tenant **FROZEN** và tắt fan-out; gói nền
-không đổi. Granted / Used / Remaining giữ **FROZEN tới hết quota month**.
-Capacity reservation được trả lại.
+không đổi. **FrozenRemaining** (Granted / Used / Remaining) được giữ tới hết quota
+month. Capacity reservation được trả lại.
 
-| | Tiền |
+**Tiền — một rule cho cả Monthly lẫn Yearly** (row 49, row 7): chỉ credit phần
+coverage **đã trả nhưng SCIO chưa cấp quota**, tức `quotaMonthEnd → xPaidThrough`,
+và chỉ khi khoảng đó tồn tại. Quota month đang chạy đã "tài trợ" GrantedTarget nên
+**không bao giờ được credit**.
+
+| Điều kiện | Stripe |
 |---|---|
-| **Monthly** | `proration_behavior=none` — **không hoàn** |
-| **Yearly** | `proration_date = quotaMonthEnd` → Stripe credit phần coverage từ quotaMonthEnd tới hết năm vào **customer balance** |
+| `quotaMonthEnd < xPaidThrough` | `proration_date = quotaMonthEnd`, `always_invoice` → credit `quotaMonthEnd → xPaidThrough` vào **customer balance** |
+| `quotaMonthEnd ≥ xPaidThrough` | `proration_behavior = none` — không có coverage tương lai, **không credit** |
 
-**Đo thật** — X gói năm mua 05/09/2026 (quota tháng 9 = **1.733**), huỷ ngày
-20/09: Stripe credit **$200.61** cho 01/10/2026 → 05/09/2027; tháng 9 vẫn 1.733.
+**Đo thật:**
+
+| Trường hợp | Kết quả |
+|---|---|
+| Monthly, billing neo ngày 1, huỷ 10/09 | trả tới 01/10 = quotaMonthEnd → **không credit** |
+| Monthly, billing 20/09 → 20/10, huỷ 25/09 | credit **$12.67** cho 01/10 → 20/10; tháng 9 vẫn giữ 733 |
+| Yearly mua 05/09/2026 (tháng 9 = **1.733**), huỷ 20/09 | credit **$200.61** cho 01/10/2026 → 05/09/2027 |
 
 ---
 
-## 8. Resume
+## 8. Mua lại X sau Cancel
 
-Charge lại từ **`max(bây giờ, hết phần đã trả)`** — không bao giờ thu trùng một
-đoạn đã trả, và với gói năm thì debit lại **đúng mốc** đã credit (EASY 1).
-Ledger chỉ mở lại **sau khi thanh toán thành công**; thẻ hỏng thì vẫn FROZEN.
+**Không có nút khôi phục riêng** (row 59). Muốn dùng lại, user **mua lại X** — bật X
+lại hoặc nút *Buy X again* — và backend re-add X item như một lần mua. FrozenRemaining
+chỉ mở lại **sau khi thanh toán thành công**; thẻ hỏng thì vẫn FROZEN.
 
-| Trường hợp | Kết quả đo được |
+- **Trước quotaMonthEnd:** khôi phục FrozenRemaining, và portal báo rằng nó **vẫn hết
+  hạn tại quotaMonthEnd**. Không thu trùng tới
+  `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)`; phần coverage tương lai đã
+  credit lúc huỷ thì được debit lại đúng phần được mua lại; thời gian sau
+  `AlreadyPaidUntil` prorate bình thường.
+- **Từ quotaMonthEnd trở đi:** là kích hoạt mới — quota cũ đã hết hạn, Stripe prorate
+  từ lúc mua, tháng mới cấp theo paid coverage.
+
+| Trường hợp (đo thật) | Kết quả |
 |---|---|
-| Monthly, huỷ 10/09, resume 15/09 | đã trả tới 01/10 → `proration_behavior=none`, **không có hoá đơn**; mở lại đúng ledger **2.000 / Used 300** |
-| Yearly, huỷ 20/09, resume 25/09 | hoá đơn **$200.61** từ 01/10, trả bằng balance (**$0 trừ thẻ**); ledger 1.733 giữ nguyên, coverage liền một năm |
-| Monthly, huỷ 20/09, resume **05/10** (qua quotaMonthEnd) | kích hoạt mới: thu **$17.42** (05/10 → 01/11), tháng 10 cấp floor(2.000 × 27/31) = **1.741**, Used 0 |
+| Monthly neo ngày 1, huỷ 10/09, mua lại 15/09 | đã trả tới 01/10 → `proration_behavior=none`, **không có hoá đơn**; khôi phục **2.000 / Used 300** |
+| Row 59 ví dụ 1 — neo ngày 5, mua 30/08, huỷ 02/09, mua lại 04/09 | `AlreadyPaidUntil` = 05/09 → không thu 04/09 → 05/09, khôi phục **266 / Used 50**; ngày 05/09 X gia hạn bình thường và tháng 9 lên **2.000**, Used vẫn 50 |
+| Yearly, huỷ 20/09, mua lại 25/09 | hoá đơn **$200.61** từ 01/10, trả bằng balance (**$0 trừ thẻ**); tháng 9 vẫn 1.733, coverage liền một năm |
+| Row 59 ví dụ 2 — billing 20/09 → 20/10, huỷ 25/09 (credit 01/10 → 20/10), mua lại **05/10** | kích hoạt mới: thu **$10.00** cho 05/10 → 20/10; 01/10 → 05/10 vẫn là credit ròng; tháng 10 cấp floor(2.000 × 15/31) = **967** |
+| Monthly neo ngày 1, huỷ 20/09, mua lại **05/10** | kích hoạt mới: thu **$17.42** (05/10 → 01/11), tháng 10 cấp **1.741**, Used 0 |
+
+**Row 47 ví dụ 2 cũng được đo:** mua 30/08 khi billing neo ngày 5 → tháng 8 được
+floor(2.000 × 2/31) = **129**, sang 01/09 tháng 9 mở ở floor(2.000 × 4/30) = **266**
+chứ không tự cấp 2.000.
 
 ---
 
@@ -146,7 +170,7 @@ Ledger chỉ mở lại **sau khi thanh toán thành công**; thẻ hỏng thì 
   coverage hợp tăng. Đo thật: mua 15/09 (1.066), đổi sang năm ngày 20/09 → vẫn
   **1.066**, không cộng thêm 733.
 - **X đang FROZEN:** chỉ gói nền đổi, X không bị charge / credit và vẫn frozen.
-  Resume sau đó dùng interval hiện tại của gói nền.
+  Mua lại X sau đó dùng interval hiện tại của gói nền.
 
 ---
 

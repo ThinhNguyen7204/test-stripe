@@ -37,6 +37,14 @@ console.log('\n\x1b[1mFirst purchase mid-month (row 47, CASE 1)\x1b[0m');
   check('nothing granted ahead for October', q.grantedTarget(cov, lines, q.quotaMonthOf(at(2026, 10, 2))), 0);
 }
 
+{
+  // row 47, example 2: bought 30/08 with the billing boundary 05/09
+  const lines = [line('in_2', at(2026, 8, 30), 387, at(2026, 8, 30), at(2026, 9, 5))];
+  const cov = q.coverageFromLines(lines);
+  check('30/08 → 01/09: floor(2,000 × 2/31) = 129', q.grantedTarget(cov, lines, q.quotaMonthOf(at(2026, 8, 30))), 129);
+  check('01/09 → 05/09: floor(2,000 × 4/30) = 266 — 01/09 grants no 2,000 of its own', q.grantedTarget(cov, lines, q.quotaMonthOf(at(2026, 9, 2))), 266);
+}
+
 console.log('\n\x1b[1mAnnual quota months and the true-up (rows 52, 63, CASE 10)\x1b[0m');
 {
   const lines = [line('in_y', at(2026, 9, 5), 21600, at(2026, 9, 5), at(2027, 9, 5), true)];
@@ -60,10 +68,10 @@ console.log('\n\x1b[1mAnnual quota months and the true-up (rows 52, 63, CASE 10)
   check('and grants nothing after quotaMonthEnd', q.grantedTarget(covCut, cut, q.quotaMonthOf(at(2026, 10, 2))), 0);
   check('coverage ends at quotaMonthEnd', q.coverageEnd(covCut), at(2026, 10, 1));
 
-  // resume debits the same boundary back: the year is whole again
+  // buying X again debits the same boundary back: the year is whole again
   const resumed = [...cut, line('in_r', at(2026, 9, 25), 18000, at(2026, 10, 1), at(2027, 9, 5), true)];
   const covRes = q.coverageFromLines(resumed);
-  check('after resume the last month gets its true-up again', q.grantedTarget(covRes, resumed, q.quotaMonthOf(at(2027, 9, 1))), 267);
+  check('after buying X again the last month gets its true-up again', q.grantedTarget(covRes, resumed, q.quotaMonthOf(at(2027, 9, 1))), 267);
 }
 
 console.log('\n\x1b[1mInterval change never double-grants (rows 6, 60, CASE 9)\x1b[0m');
@@ -91,14 +99,14 @@ console.log('\n\x1b[1mRenewal adds the missing delta only (rows 46, 66)\x1b[0m')
 
 console.log('\n\x1b[1mReplay order (idempotent reconcile)\x1b[0m');
 {
-  // cancel and resume in the same simulated second: the invoice number orders them
+  // cancel and buy-again in the same simulated second: the invoice number orders them
   const t = at(2026, 9, 20);
   const lines = [
     line('in_y', at(2026, 9, 5), 21600, at(2026, 9, 5), at(2027, 9, 5), true),
     line('in_cancel', t, -18000, at(2026, 10, 1), at(2027, 9, 5), true),
     line('in_resume', t, 18000, at(2026, 10, 1), at(2027, 9, 5), true),
   ];
-  check('cancel then resume in the same second leaves the year whole', q.coverageFromLines(lines), [{ start: at(2026, 9, 5), end: at(2027, 9, 5) }]);
+  check('cancel then buy-again in the same second leaves the year whole', q.coverageFromLines(lines), [{ start: at(2026, 9, 5), end: at(2027, 9, 5) }]);
   check('replaying twice gives the same answer', q.coverageFromLines([...lines].reverse()), [{ start: at(2026, 9, 5), end: at(2027, 9, 5) }]);
 }
 

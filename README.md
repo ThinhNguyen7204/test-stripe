@@ -134,9 +134,9 @@ chỉ cộng phần delta dương. Gói năm vẫn cấp theo từng quota month
 | Mua giữa quota month | prorate tới billing boundary, thu ngay | `floor(2.000 × phần đã trả / tháng)` — mua 15/09, trả tới 01/10 → **1.066** |
 | Renewal giữa quota month | Stripe thu kỳ mới | cộng phần còn thiếu vào **cùng** ledger (580 → +1.420 = 2.000) |
 | Monthly ⇄ Yearly (X đang ACTIVE) | native proration cùng gói nền | giữ Used, chỉ tăng nếu coverage tăng |
-| **Cancel X** | xoá item **ngay**. Monthly: `proration_behavior=none`, không hoàn. Yearly: `proration_date = quotaMonthEnd` → credit phần từ quotaMonthEnd vào customer balance | **FROZEN** tới quotaMonthEnd, tắt fan-out, giải phóng capacity |
-| **Resume** cùng quota month | re-add item, charge từ `max(now, paidThrough)` — Monthly không thu trùng, Yearly debit lại đúng mốc đã credit | mở lại **đúng ledger cũ** (Granted/Used giữ nguyên) sau khi payment thành công |
-| Resume sau quotaMonthEnd | như mua mới | quota cũ hết hạn, tháng mới cấp theo paid coverage |
+| **Cancel X** | xoá item **ngay**, cả Monthly lẫn Yearly: nếu `quotaMonthEnd < xPaidThrough` thì `proration_date = quotaMonthEnd` → credit `quotaMonthEnd → xPaidThrough` vào customer balance; ngược lại `proration_behavior=none`, không credit. Không bao giờ credit phần quota month đang chạy | **FROZEN** tới quotaMonthEnd, tắt fan-out, giải phóng capacity; FrozenRemaining được giữ |
+| **Mua lại X** trước quotaMonthEnd | **không có nút khôi phục riêng** — bật X lại là một lần mua; không thu trùng tới `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)`, phần đã credit thì debit lại đúng mốc đó | khôi phục **FrozenRemaining** (Granted/Used như cũ) sau khi payment thành công, vẫn hết hạn tại quotaMonthEnd |
+| Mua lại X từ quotaMonthEnd trở đi | như mua mới, Stripe prorate bình thường | quota cũ hết hạn, tháng mới cấp theo paid coverage |
 | Hạ gói nền về Free | cuối kỳ đã trả, không prorate | X chạy tới boundary rồi ENDED cùng gói nền |
 | Payment fail | không có coverage mới | chỉ dùng phần đã grant, qua paidThrough thì dừng fetch; trả được thì cộng delta |
 
@@ -176,7 +176,7 @@ Tab **Billing policy** trong UI (hoặc `GET/PUT /api/policy`) chỉnh:
   `refund_to_payment_method` (hoàn về thẻ), `none` (thu hồi credit),
   `block` (**từ chối** thao tác nếu nó khiến công ty phải trả lại tiền).
 - **Per-add-on override** (`addOnRules`) — đè rule riêng cho từng add-on theo
-  code. X Social **không** đi qua đây: mua / huỷ / resume của nó do MODEL V6
+  code. X Social **không** đi qua đây: mua / huỷ / mua lại của nó do MODEL V6
   chốt cứng trong `backend/src/x-addon/`.
 - **Cancellation** — huỷ cuối kỳ hay huỷ ngay, có prorate không, phần chưa dùng
   thành credit hay hoàn về thẻ.
@@ -254,10 +254,11 @@ mà không cần đổi policy chung.
     paidThrough và capacity.
 10b. **Provider fetch** — trong khối X add-on chọn Initial/Auto/Manual, nhập
     *asked* và *returned*: quota trừ theo *returned*, clamp theo Remaining.
-10c. **Cancel → Resume** — *Cancel X*: tenant FROZEN tới hết quota month. Gói
-    tháng không hoàn; gói năm credit từ quotaMonthEnd. *Resume X* trong cùng
-    quota month mở lại đúng ledger cũ; tua qua ngày 1 rồi resume thì là kích hoạt
-    mới. Kịch bản đầy đủ: `node scripts/verify-x-v6.mjs`.
+10c. **Cancel → Mua lại X** — *Cancel X*: tenant FROZEN tới hết quota month; chỉ
+    credit phần `quotaMonthEnd → xPaidThrough` nếu nó tồn tại (billing neo ngày 20
+    thì có, neo ngày 1 thì không). *Buy X again* (hoặc bật X lại) trước ngày 1
+    khôi phục FrozenRemaining; tua qua ngày 1 rồi mua lại thì là kích hoạt mới.
+    Kịch bản đầy đủ: `node scripts/verify-x-v6.mjs`.
 
 Tab **Activity log** ghi lại mọi thao tác: rule nào được áp, policy lúc đó ra
 sao, payload gửi sang Stripe là gì và Stripe trả về gì.
@@ -289,8 +290,8 @@ sao, payload gửi sang Stripe là gì và Stripe trả về gì.
 | `POST` | `/api/policy/presets/:key` | áp preset |
 | `POST` | `/api/simulator/:id/advance` | tua test clock |
 | `GET` | `/api/x-addon/:id` | X add-on: status, quota month, ledger, paidThrough, coverage, capacity (reconcile từ hoá đơn đã paid) |
-| `POST` | `/api/x-addon/:id/preview/:action` | dry-run `purchase` \| `cancel` \| `resume` |
-| `POST` | `/api/x-addon/:id/cancel` \| `/resume` \| `/trial` | vòng đời X theo MODEL V6 |
+| `POST` | `/api/x-addon/:id/preview/:action` | dry-run `purchase` \| `cancel` (mua lại sau Cancel cũng là `purchase`) |
+| `POST` | `/api/x-addon/:id/cancel` \| `/trial` | vòng đời X theo MODEL V6 — không có route resume; mua lại đi qua `/subscriptions/:id/change` |
 | `POST` | `/api/x-addon/:id/sync-runs` | một lần fetch provider `{kind, requested, returned, actionId}` — trừ quota exactly-once |
 | `POST` | `/api/webhooks/stripe` | webhook (raw body, có verify chữ ký) |
 | `GET` | `/api/events` | nhật ký audit |
@@ -307,7 +308,7 @@ backend/src/
   subscriptions/phân loại thay đổi → dựng item → update / schedule / cancel
   billing/      hoá đơn, refund, credit note, customer portal
   simulator/    test clock
-  x-addon/      X Social MODEL V6: quota ledger theo quota month, capacity, cancel/resume/trial
+  x-addon/      X Social MODEL V6: quota ledger theo quota month, capacity, cancel/mua lại/trial
   webhooks/     nhận sự kiện, sync ngược về Mongo, thực thi dunning
   events/       audit log (policy + payload + kết quả)
 ```
