@@ -171,8 +171,9 @@ export const ADDONS: CatalogItemDef[] = [
  * Standard/Pro split and per-licence quantity of V5 are gone (row 48).
  *
  * Money is Stripe's and is prorated natively like any other item. Quota is
- * SCIO's: 2,000 Post Updates for each fully paid calendar quota month, granted
- * by paid time (rows 5, 6, 47).
+ * SCIO's: 2,000 Post Updates for each fully paid quota month — stepped from the
+ * base plan's billing anchor at first purchase — granted by paid time (rows 5,
+ * 6, 47; operator decision 2026-09-25).
  */
 export const X_SOCIAL_ADDON: CatalogItemDef = {
   code: 'x_social',

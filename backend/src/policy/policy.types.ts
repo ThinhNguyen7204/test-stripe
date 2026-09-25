@@ -165,6 +165,11 @@ export interface ConstraintPolicy {
   enforceCapacityGuard: boolean;
   xCommercialCeilingUnits: number;
   xProviderHardCapUnits: number;
+  /**
+   * Test switch: make the boundary cleanup of a quantity-0 X item fail, so the
+   * 24-hour retry and the reuse of a still-present item can be exercised.
+   */
+  xCleanupPaused?: boolean;
 }
 
 export interface DunningPolicy {

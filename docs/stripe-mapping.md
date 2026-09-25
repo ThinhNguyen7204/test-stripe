@@ -1,218 +1,233 @@
-# Billing policy → tham số Stripe
+# Billing policy → Stripe parameters
 
-Toàn bộ "cơ chế" của app nằm trong một document duy nhất trong MongoDB
-(`billing_policies`, key = `active`). Mỗi field ánh xạ thẳng sang một tham số
-Stripe. Sửa policy = đổi hành vi thật của Stripe, không phải đổi phép tính nội
-bộ của app.
+The app's entire "mechanism" lives in a single document in MongoDB
+(`billing_policies`, key = `active`). Each field maps directly to a Stripe
+parameter. Editing the policy = changing Stripe's real behaviour, not changing the
+app's internal arithmetic.
 
 ## 1. Change rules
 
-App phân loại mọi thay đổi vào đúng **một** rule, theo thứ tự ưu tiên:
-`term → plan → screens → add-ons` (xem `subscription.util.ts:classifyChange`).
+The app classifies every change into exactly **one** rule, in priority order:
+`term → plan → screens → add-ons` (see `subscription.util.ts:classifyChange`).
 
-| Rule key | Khi nào |
+| Rule key | When |
 |---|---|
-| `screensIncrease` / `screensDecrease` | đổi số màn hình |
-| `planUpgrade` / `planDowngrade` | đổi tier (so sánh `tierRank`) |
-| `addOnIncrease` / `addOnDecrease` | đổi add-on |
+| `screensIncrease` / `screensDecrease` | screen count changes |
+| `planUpgrade` / `planDowngrade` | tier changes (compared by `tierRank`) |
+| `addOnIncrease` / `addOnDecrease` | add-on changes |
+| `termToYearly` / `termToMonthly` | term changes |
 
-Mặc định **cả ba rule "mua thêm"** — `screensIncrease`, `planUpgrade`,
-`addOnIncrease` — đều dùng `always_invoice` + `error_if_incomplete`: khách mua
-thêm thì **trả tiền ngay**, thẻ fail thì thay đổi bị huỷ.
+By default **all three "buy more" rules** — `screensIncrease`, `planUpgrade`,
+`addOnIncrease` — use `always_invoice` + `error_if_incomplete`: when the customer
+buys more they **pay immediately**, and if the card fails the change is cancelled.
 
-Đối xứng với nó, **cả ba rule "bớt đi"** — `screensDecrease`, `planDowngrade`,
-`addOnDecrease` — dùng `create_prorations` + `push_to_account_balance`: phần chưa
-dùng thành account credit nhìn thấy được, không có tiền rời khỏi Stripe.
+Symmetrically, **all three "reduce" rules** — `screensDecrease`, `planDowngrade`,
+`addOnDecrease` — use `create_prorations` + `push_to_account_balance`: the unused
+portion becomes visible account credit, and no money leaves Stripe.
 
-Ví dụ thêm màn hình (Engage, 2 → 3 màn hình, còn 20/30 ngày): hoá đơn
-`subscription_update` **$20.00** = $30 × 20/30 cho màn hình thứ ba, thu ngay,
-ngày gia hạn không đổi, hoá đơn kỳ sau sạch không còn khoản treo.
+Example of adding a screen (Engage, 2 → 3 screens, 20/30 days remaining): invoice
+`subscription_update` **$20.00** = $30 × 20/30 for the third screen, collected
+immediately, renewal date unchanged, next period's invoice is clean with nothing pending.
 
-Ví dụ lên gói giữa kỳ (Standard → Pro Plus, 4 màn hình, còn 20/30 ngày):
-Stripe xuất một hoá đơn `subscription_update` gồm `−$26.67` hoàn phần Standard
-chưa dùng và `+$40.00` phần Pro Plus còn lại → **thu $13.33**, tức đúng phần
-chênh lệch cho số ngày còn lại. Ngày gia hạn không đổi, không còn khoản nào treo
-sang kỳ sau. Thẻ fail thì gói giữ nguyên, khách không được dùng tier cao hơn.
+Example of a mid-period upgrade (Standard → Pro Plus, 4 screens, 20/30 days remaining):
+Stripe issues one `subscription_update` invoice containing `−$26.67` refunding the unused
+Standard portion and `+$40.00` for the remaining Pro Plus portion → **collects $13.33**, i.e.
+exactly the difference for the remaining days. Renewal date unchanged, nothing left pending
+into the next period. If the card fails the plan stays as is, and the customer does not get the higher tier.
 
-Mua
-add-on là **thu tiền ngay** (phần prorate cho số ngày còn lại của kỳ), không treo
-sang hoá đơn sau, và nếu thẻ bị từ chối thì thay đổi bị huỷ — khách không được
-dùng add-on miễn phí. Ngày gia hạn giữ nguyên vì `billing_cycle_anchor` vẫn là
+Buying an
+add-on **collects payment immediately** (the prorated portion for the remaining days of the period), nothing is left pending
+for the next invoice, and if the card is declined the change is cancelled — the customer does not get
+to use the add-on for free. The renewal date stays the same because `billing_cycle_anchor` is still
 `unchanged`.
 
-Lưu ý: `always_invoice` quét **mọi** proration đang treo trên subscription, nên
-nếu trước đó khách đã thêm màn hình theo `create_prorations` thì khoản đó cũng
-bị thu cùng lúc.
-| `termToYearly` / `termToMonthly` | đổi chu kỳ |
+Note: `always_invoice` sweeps **every** pending proration on the subscription, so
+if the customer previously added screens under `create_prorations`, that amount is
+also collected at the same time.
 
-Mỗi rule có 5 nút vặn:
+Each rule has 5 knobs:
 
-| Field | Tham số Stripe | Ý nghĩa |
+| Field | Stripe parameter | Meaning |
 |---|---|---|
-| `timing` | `subscriptions.update` vs `subscriptionSchedules.update` | áp ngay, hay chờ cuối kỳ |
-| `prorationBehavior` | `proration_behavior` | `create_prorations` (dồn hoá đơn sau) / `always_invoice` (xuất hoá đơn ngay) / `none` |
-| `billingCycleAnchor` | `billing_cycle_anchor` | `unchanged` giữ ngày gia hạn, `now` reset chu kỳ và thu trọn kỳ mới |
-| `paymentBehavior` | `payment_behavior` | `error_if_incomplete` chặn thay đổi nếu thẻ fail, `default_incomplete` chờ 3DS, ... |
-| `creditHandling` | (logic của app) | credit sinh ra đi đâu: để trên **customer balance**, **refund về thẻ**, hay **thu hồi** |
+| `timing` | `subscriptions.update` vs `subscriptionSchedules.update` | apply immediately, or wait until period end |
+| `prorationBehavior` | `proration_behavior` | `create_prorations` (roll into the next invoice) / `always_invoice` (issue an invoice immediately) / `none` |
+| `billingCycleAnchor` | `billing_cycle_anchor` | `unchanged` keeps the renewal date, `now` resets the cycle and charges a full new period |
+| `paymentBehavior` | `payment_behavior` | `error_if_incomplete` blocks the change if the card fails, `default_incomplete` waits for 3DS, ... |
+| `creditHandling` | (app logic) | where generated credit goes: left on the **customer balance**, **refunded to the card**, or **clawed back** |
 
-### Credit nằm ở đâu — và app đo nó bằng cách nào
+### Where the credit lives — and how the app measures it
 
-Đây là chỗ dễ sai nhất. Tuỳ `proration_behavior`, credit của khách nằm ở hai
-nơi hoàn toàn khác nhau:
+This is the easiest place to get wrong. Depending on `proration_behavior`, the customer's credit lives in two
+completely different places:
 
-- `create_prorations` → credit là **pending invoice item âm** treo trên
-  subscription, chờ hoá đơn kỳ sau quét vào. `customer.balance` **không đổi**.
-- `always_invoice` → Stripe xuất hoá đơn ngay; nếu net âm thì phần dư rơi vào
-  **customer balance** (`ending_balance` âm).
+- `create_prorations` → the credit is a **negative pending invoice item** pending on the
+  subscription, waiting for the next period's invoice to sweep it in. `customer.balance` **does not change**.
+- `always_invoice` → Stripe issues an invoice immediately; if the net is negative, the remainder lands in the
+  **customer balance** (negative `ending_balance`).
 
-Vì vậy đo credit bằng cách so `customer.balance` trước/sau là **không đủ** — với
-preset mặc định (create_prorations) luôn ra 0. App đo bằng chính Stripe: preview
-hoá đơn sắp tới hai lần — một lần nguyên trạng, một lần "giả sử đã đổi" — rồi
-lấy hiệu của tổng các dòng proration:
+So measuring credit by comparing `customer.balance` before/after is **not enough** — with
+the default preset (create_prorations) it always comes out 0. The app measures with Stripe itself: it previews
+the upcoming invoice twice — once as is, once "assuming the change was made" — then
+takes the difference of the sums of the proration lines:
 
 ```
-prorationsBefore = Σ(proration lines của upcoming invoice hiện tại)
-prorationsAfter  = Σ(proration lines khi preview kèm items mới)
+prorationsBefore = Σ(proration lines of the current upcoming invoice)
+prorationsAfter  = Σ(proration lines when previewing with the new items)
 credit           = max(0, prorationsBefore − prorationsAfter)
 ```
 
-`proration_date` được ghim cho cả preview lẫn lần update thật để hai bên tính ra
-đúng cùng một con số.
+`proration_date` is pinned for both the preview and the real update so that both sides compute
+exactly the same number.
 
-**Gộp hay ròng — chọn đúng con số mới không hoàn dư.** Số dùng để hoàn tiền phụ
-thuộc vào `proration_behavior`:
+**Gross or net — only the right number avoids over-refunding.** The number used for the refund depends
+on `proration_behavior`:
 
-| proration_behavior | Credit nằm đâu | App dùng số nào |
+| proration_behavior | Where the credit lives | Which number the app uses |
 |---|---|---|
-| `create_prorations` | pending invoice item âm, balance không đổi | hiệu tổng dòng proration (**gộp**) |
-| `always_invoice` | Stripe đã chốt hoá đơn — trong đó có cả kỳ mới bị tính tiền và mọi proration còn treo | biến động **customer balance** (**ròng**) |
+| `create_prorations` | negative pending invoice item, balance unchanged | difference of proration line sums (**gross**) |
+| `always_invoice` | Stripe has settled the invoice — which includes both the new period being charged and every pending proration | change in **customer balance** (**net**) |
 
-Lấy `max` của hai tín hiệu là sai: với `always_invoice`, credit gộp $270.74 trong
-khi hoá đơn cũng thu $30.00 cho kỳ mới, nên chỉ $240.74 thực sự còn dư. Hoàn
-$270.74 là tặng không khách một tháng — và nếu còn cộng thêm bút toán bù trừ nữa
-thì khách hoá ra đang **nợ** tiền.
+Taking the `max` of the two signals is wrong: with `always_invoice`, the gross credit is $270.74 while
+the invoice also charges $30.00 for the new period, so only $240.74 is actually left over. Refunding
+$270.74 gives the customer a month for free — and if an offsetting entry is added on top,
+the customer ends up **owing** money.
 
-Sau khi biết credit là bao nhiêu:
+Once the credit amount is known:
 
-- `customer_balance` → để nguyên chỗ Stripe đặt. Với `always_invoice` đó là
-  account balance; với `create_prorations` nó chỉ là một dòng âm treo trên hoá
-  đơn kế tiếp, **`customer.balance` vẫn bằng 0**.
-- `push_to_account_balance` → luôn kết thúc dưới dạng account credit nhìn thấy
-  được. Nếu proration còn đang treo, app tạo một invoice item dương bằng đúng số
-  đó để hoá đơn kế tiếp không bị trừ hai lần, rồi ghi `customer.balance` âm.
-  Số tiền khách phải trả không đổi, chỉ khác chỗ nó hiển thị.
-- `refund_to_payment_method` → `refunds.create` trên PaymentIntent của các hoá
-  đơn đã trả gần nhất (hoàn tối đa bằng phần còn refund được), rồi ghi một
-  balance transaction **dương** đúng bằng số đã hoàn. Bước ghi ngược này bắt
-  buộc: tiền đã về thẻ thì pending proration âm không được phép trừ tiếp vào hoá
-  đơn kỳ sau nữa.
-- `none` → ghi balance transaction dương để xoá credit.
+- `customer_balance` → leave it where Stripe put it. With `always_invoice` that is the
+  account balance; with `create_prorations` it is only a negative line pending on the
+  next invoice, **`customer.balance` stays 0**.
+- `push_to_account_balance` → always ends up as visible account credit. If a proration
+  is still pending, the app creates a positive invoice item for exactly that amount so the next invoice is not
+  reduced twice, then writes a negative `customer.balance`.
+  The amount the customer pays does not change, only where it is displayed.
+- `refund_to_payment_method` → `refunds.create` on the PaymentIntent of the most recent
+  paid invoices (refunding at most the refundable remainder), then writes a
+  **positive** balance transaction exactly equal to the refunded amount. This reversing entry is
+  mandatory: once the money is back on the card, the negative pending proration must not also be deducted from the
+  next period's invoice.
+- `none` → write a positive balance transaction to wipe the credit.
 
-## 2. `timing: end_of_period` hoạt động thế nào
+## 2. How `timing: end_of_period` works
 
-App tạo (hoặc tái dùng) một **subscription schedule** từ subscription hiện tại,
-giữ nguyên các phase đang chạy và nối thêm một phase mới với cấu hình mong muốn,
-`proration_behavior: 'none'`, `end_behavior: 'release'`. Subscription giữ nguyên
-cho tới hết kỳ đã trả tiền rồi tự chuyển sang phase mới.
+The app creates (or reuses) a **subscription schedule** from the current subscription,
+keeps the running phases unchanged and appends a new phase with the desired configuration,
+`proration_behavior: 'none'`, `end_behavior: 'release'`. The subscription stays unchanged
+until the end of the paid period, then automatically moves to the new phase.
 
-Khi có thay đổi `immediate` xảy ra trong lúc đang có schedule, app **release**
-schedule trước để hai cơ chế không đánh nhau.
+When an `immediate` change happens while a schedule exists, the app **releases**
+the schedule first so the two mechanisms do not fight each other.
 
-## 2b. Ví dụ đọc kỹ: yearly → monthly
+## 2b. Worked example: yearly → monthly
 
-Đây là thay đổi dễ gây tranh cãi nhất nên đáng nêu riêng.
+This is the most contentious change, so it deserves its own section.
 
-**Mặc định (`termToMonthly`: immediate / always_invoice / anchor now / push_to_account_balance)**
+**Default (`termToMonthly`: immediate / always_invoice / anchor now / push_to_account_balance)**
 
-1. `classifyChange` thấy term đổi → ruleKey `termToMonthly` (term có ưu tiên cao
-   nhất, trên plan/screens/add-on).
-2. `subscriptions.update` với `billing_cycle_anchor: 'now'` → chu kỳ khởi động
-   lại ngay hôm nay, Stripe xuất một hoá đơn `subscription_update` gồm: phần năm
-   **chưa dùng** (âm) cộng **tháng monthly đầu tiên** (dương).
-3. Phần âm còn dư sau khi bù trừ rơi vào `customer.balance` — **tiền không rời
-   khỏi Stripe**, không có refund nào về thẻ.
-4. Các hoá đơn monthly kế tiếp tự tiêu credit đó cho tới khi hết.
+1. `classifyChange` sees the term changed → ruleKey `termToMonthly` (term has the highest
+   priority, above plan/screens/add-on).
+2. `subscriptions.update` with `billing_cycle_anchor: 'now'` → the cycle restarts
+   today, Stripe issues a `subscription_update` invoice containing: the **unused**
+   portion of the year (negative) plus the **first monthly month** (positive).
+3. The negative remainder after offsetting lands in `customer.balance` — **money does not leave
+   Stripe**, there is no refund to the card.
+4. Subsequent monthly invoices consume that credit automatically until it runs out.
 
-Số thật đo được (Pro Plus, 2 màn hình, đổi sau 2/12 tháng):
+Measured numbers (Pro Plus, 2 screens, changed after 2/12 months):
 
 | | |
 |---|---|
-| Đã thu cho năm | $324.00 (2 × $13.50 × 12) |
-| Credit **gộp** phần năm chưa dùng | $270.74 |
-| Tháng monthly đầu bị tính | $30.00 |
-| Credit **ròng** → account balance | **−$240.74** |
-| Refund về thẻ | **$0.00** |
-| Hoá đơn monthly kế tiếp | $0.00 (`starting_balance` tự trừ) |
+| Collected for the year | $324.00 (2 × $13.50 × 12) |
+| **Gross** credit for the unused year | $270.74 |
+| First monthly month charged | $30.00 |
+| **Net** credit → account balance | **−$240.74** |
+| Refund to card | **$0.00** |
+| Next monthly invoice | $0.00 (`starting_balance` deducts automatically) |
 
-Muốn tiền chạy về thẻ thật thì đổi `creditHandling` của rule đó sang
-`refund_to_payment_method` — preset `customer_friendly` đã set sẵn như vậy.
+To send the money back to the real card, change that rule's `creditHandling` to
+`refund_to_payment_method` — the `customer_friendly` preset already sets it that way.
 
-**Preset `annual_commitment` (end_of_period / none / không hoàn)**
+**Preset `annual_commitment` (end_of_period / none / no refund)**
 
-Cùng thao tác nhưng không đụng subscription đang chạy: app tạo subscription
-schedule, nối một phase monthly (`duration: 1 month`, `end_behavior: release`),
-`pendingChange.effectiveAt` = ngày hết kỳ năm. Không thu thêm, không hoàn đồng
-nào, số hoá đơn giữ nguyên. Tới ngày đó Stripe kích hoạt phase monthly và xuất
-hoá đơn $30.00.
+Same action, but it does not touch the running subscription: the app creates a subscription
+schedule, appends a monthly phase (`duration: 1 month`, `end_behavior: release`),
+`pendingChange.effectiveAt` = the end date of the yearly period. Nothing extra is charged, not a cent is
+refunded, the invoice count stays the same. On that date Stripe activates the monthly phase and issues
+a $30.00 invoice.
 
-**Lưu ý về preview.** Với thay đổi `end_of_period`, app preview bằng
-`preview_mode: 'recurring'` để lấy một kỳ đầy đủ ở cấu hình mới. Stripe vẫn định
-giá nó dựa trên kỳ hiện tại nên **ngày trên từng dòng là khung tham chiếu của
-Stripe, không phải ngày hiệu lực thật** — UI ẩn các ngày đó và chỉ hiện
-`effectiveAt` lấy từ `current_period_end`.
+**Note on preview.** For an `end_of_period` change, the app previews with
+`preview_mode: 'recurring'` to get a full period at the new configuration. Stripe still prices
+it based on the current period, so **the dates on each line are Stripe's reference frame,
+not the real effective date** — the UI hides those dates and only shows
+`effectiveAt` taken from `current_period_end`.
 
-**Lưu ý về test clock.** Khi đã có phase monthly nằm trong schedule, Stripe chỉ
-cho tua tối đa 2 tháng mỗi lần (giới hạn theo chu kỳ ngắn nhất trên clock). Vì
-vậy `simulator.advance` tự chia thành nhiều chặng, dùng đúng mốc trần Stripe báo
-về, và ghi số chặng vào audit log.
+**Note on test clocks.** Once a monthly phase is in the schedule, Stripe only
+allows advancing at most 2 months at a time (limited by the shortest interval on the clock). So
+`simulator.advance` automatically splits into multiple legs, uses exactly the ceiling Stripe reports
+back, and records the number of legs in the audit log.
 
-## 2c. Nút vặn vô hiệu
+## 2c. Ineffective knobs
 
-`GET /api/policy` trả kèm `warnings[]`, và tab Billing policy hiện chúng ở khối
-"Settings that cannot fire". Đây không phải lỗi — chỉ là những tổ hợp mà một ô
-trông như đang bật nhưng không bao giờ chạy tới:
+`GET /api/policy` also returns `warnings[]`, and the Billing policy tab shows them in the
+"Settings that cannot fire" block. These are not errors — just combinations where a field
+looks enabled but is never reached:
 
-- `cancellation.refundUnusedTime` khác `none` trong khi `prorateUnusedTime` tắt
-  và `timing = immediate` → huỷ ngay sẽ cắt dịch vụ mà **không trả lại gì**.
-- `prorateUnusedTime` bật trong khi `timing = at_period_end` → không có thời
-  gian nào chưa dùng để prorate.
-- rule có `prorationBehavior = none` nhưng `creditHandling` khác `none` → không
-  có credit nào được tạo để mà xử lý.
-- rule có `timing = end_of_period` nhưng đặt `prorationBehavior` /
-  `billingCycleAnchor` → phase mới bắt đầu sạch ở kỳ gia hạn, hai ô đó bị bỏ qua.
-- `trial.requirePaymentMethod` bật trong khi `appliesTo = never`.
+- `cancellation.refundUnusedTime` other than `none` while `prorateUnusedTime` is off
+  and `timing = immediate` → immediate cancel cuts the service **without returning anything**.
+- `prorateUnusedTime` on while `timing = at_period_end` → there is no unused
+  time to prorate.
+- a rule with `prorationBehavior = none` but `creditHandling` other than `none` → no
+  credit is created to be handled.
+- a rule with `timing = end_of_period` but `prorationBehavior` /
+  `billingCycleAnchor` set → the new phase starts clean at renewal, those two fields are ignored.
+- `trial.requirePaymentMethod` on while `appliesTo = never`.
 
-Cả 5 preset dựng sẵn đều cho 0 cảnh báo.
+All 5 built-in presets produce 0 warnings.
 
-## 2d. X Social (MODEL V6): tiền native, quota riêng
+## 2d. X Social (MODEL V6): native money, separate quota
 
-X là một item thường trên subscription, nên **Stripe tính tiền theo thời gian như
-mọi item** — không còn nhánh tự dựng dòng tiền theo hạn mức. MODEL V6 chỉ chốt
-cứng tham số của ba thao tác (code: `backend/src/x-addon/x-addon.service.ts`):
+X is an ordinary item on the subscription, so **Stripe charges for time like
+any item** — there is no longer a branch that builds money lines by hand from the allowance. MODEL V6 only hard-fixes
+the parameters of three operations (code: `backend/src/x-addon/x-addon.service.ts`):
 
-| Thao tác | `subscriptions.update` |
+| Operation | `subscriptions.update` |
 |---|---|
-| Mua | `items: [{price, quantity: 1}]`, `proration_behavior: always_invoice`, `proration_date: now`, `payment_behavior: error_if_incomplete` |
-| Huỷ, `quotaMonthEnd < xPaidThrough` (tháng hoặc năm) | `items: [{id, deleted: true}]`, `proration_behavior: always_invoice`, **`proration_date: quotaMonthEnd`** — credit `quotaMonthEnd → xPaidThrough` |
-| Huỷ, `quotaMonthEnd ≥ xPaidThrough` | `items: [{id, deleted: true}]`, `proration_behavior: none` — không có coverage tương lai để credit |
-| Mua lại X | như Mua, nhưng `proration_date = max(now, hết phần đã trả)` — trước quotaMonthEnd đó chính là `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)`; nếu mốc đó ≥ cuối kỳ thì `proration_behavior: none` |
-| Đổi interval | không có luật riêng: item X đổi price cùng gói nền theo rule `termToYearly` / `termToMonthly` |
+| Buy | `items: [{price, quantity: 1}]`, `proration_behavior: always_invoice`, `proration_date: now`, `payment_behavior: error_if_incomplete` |
+| Cancel, `quotaMonthEnd < xPaidThrough` (monthly or yearly) | `items: [{id, quantity: 0}]`, `proration_behavior: always_invoice`, **`proration_date: quotaMonthEnd`** — credit `quotaMonthEnd → xPaidThrough`; item **kept** |
+| Cancel, `quotaMonthEnd ≥ xPaidThrough` | `items: [{id, quantity: 0}]`, `proration_behavior: none` — no future coverage to credit |
+| Cleanup at `AlreadyPaidUntil` | `items: [{id, deleted: true}]`, `proration_behavior: none`, idempotency key `x-cleanup-<item>-<attempt>` — only when the item is still quantity 0, the tenant is still FROZEN, and no purchase holds the tenant lock |
+| Buy X again before `AlreadyPaidUntil` | **same item** `items: [{id, price, quantity: 1}]`, `proration_date = AlreadyPaidUntil`, `always_invoice`; if that point is the period end then `proration_behavior: none` (no interval left to prorate) |
+| Buy X again from `AlreadyPaidUntil` onwards | `proration_date: now`, `always_invoice` — on the quantity 0 item if cleanup has not run, otherwise `items: [{price, quantity: 1}]` as in Buy |
+| Change interval | X ACTIVE: the X item changes price together with the base plan under rule `termToYearly` / `termToMonthly`. X FROZEN with the item still present: a **separate request first**, `items: [{id, price, quantity: 0}]` with `proration_behavior: none` — `quantity: 0` stated because a price change otherwise resets it — then the base plan's change without the X item. One combined request credits X for now → quotaMonthEnd (measured −$4.73), because Stripe still counts the item at quantity 1 up to the Cancel's future `proration_date` |
 
-Đo được trên test mode (X năm $216 mua 05/09/2026, huỷ 20/09):
+Measured in test mode (yearly X $216 bought 05/09/2026, cancelled 20/09):
 
-- Stripe **chấp nhận `proration_date` ở tương lai** trên item, miễn là nằm trong
-  kỳ hiện tại: hoá đơn huỷ có đúng một dòng `−$200.61` kỳ `2026-10-01 →
-  2027-09-05`, tự `paid`, ghi vào customer balance. Việc xoá item thì vẫn xảy ra
-  **ngay**.
-- Mua lại X với cùng `proration_date` tạo dòng `+$200.61` đúng kỳ đó; hoá đơn trả
-  bằng balance nên `amount_due = $0`.
+- Stripe **accepts a future `proration_date`** on an item, as long as it lies within
+  the current period: the cancel invoice credits `−$198.25` for the period `2026-10-05 →
+  2027-09-05` (from quotaMonthEnd, the end of the quota month 05/09 → 05/10), automatically `paid`,
+  written to the customer balance. The quantity change 1 → 0
+  still takes effect **immediately**; the invoice also has a `$0` line "remaining time on 0 × X".
+- Buying X again with the same `proration_date` on the same item (0 → 1) re-debits exactly that
+  period: the invoice is `$198.25`, paid from the balance so `amount_due = $0.00`.
+- **A quantity 0 line buys nothing**: SCIO ignores every X line with `quantity = 0` when
+  computing paid coverage, so the `$0` line on the Cancel receipt or on a renewal never
+  grants quota.
+- **Renewal coinciding exactly with `AlreadyPaidUntil`** (every monthly Cancel while the quota
+  month equals the billing month: no credit, `AlreadyPaidUntil = xPaidThrough`): Stripe renews
+  **before** cleanup gets to run, so that renewal invoice carries a `$0` X line. Cleanup runs right after,
+  and the next period's renewal **has no X line at all** (the `$0` line measured in scenarios C and N,
+  the renewal without an X line in scenario N).
 
-**Quota không đọc từ Stripe mà suy ra từ Stripe**: SCIO replay các dòng X trên
-mọi hoá đơn `status = paid` theo thứ tự tạo (trong cùng một hoá đơn, dòng âm
-trước, dòng dương sau), lấy hợp các kỳ thành *paid coverage*, rồi
-`Granted = floor(2.000 × coverage ∩ quota month / quota month)`. Replay nên
-idempotent: webhook `invoice.paid` tới hai lần, hay đọc state mỗi lần mở trang,
-đều ra cùng một kết quả.
+**Quota is not read from Stripe but derived from Stripe**: SCIO replays the X lines on
+every `status = paid` invoice in creation order (within the same invoice, negative lines
+first, positive lines after), takes the union of the periods as *paid coverage*, then
+`Granted = floor(2,000 × coverage ∩ quota month / quota month)`, where the quota month is stepped
+in whole months from the tenant's quota anchor (`account.xAddon.quotaAnchor`) — the base plan's
+`billing_cycle_anchor` when X is first bought. An interval change sends `billing_cycle_anchor: now`
+for the money but leaves that anchor alone, so the quota cycle and the billing cycle can run apart.
+Stripe owns the money clock; SCIO owns the quota clock. The replay is therefore
+idempotent: an `invoice.paid` webhook arriving twice, or reading state every time the page opens,
+all yield the same result.
 
 ## 3. Cancellation
 
@@ -222,103 +237,103 @@ idempotent: webhook `invoice.paid` tới hai lần, hay đọc state mỗi lần
 | `timing: immediate` | `subscriptions.cancel({ prorate, invoice_now })` |
 | `prorateUnusedTime` | `prorate` |
 | `invoiceImmediately` | `invoice_now` |
-| `refundUnusedTime` | như `creditHandling` ở trên |
-| `moveToFreePlan` | trạng thái nội bộ: về gói Free (3 màn hình) |
+| `refundUnusedTime` | same as `creditHandling` above |
+| `moveToFreePlan` | internal state: back to the Free plan (3 screens) |
 
 ## 4. Trial
 
-| Field | Stripe / tác dụng |
+| Field | Stripe / effect |
 |---|---|
-| `appliesTo` | quyết định có gắn `trial_period_days` hay không: `only_without_payment_method` (mặc định, giống OptiSigns), `always`, `never` |
+| `appliesTo` | decides whether to attach `trial_period_days`: `only_without_payment_method` (default, same as OptiSigns), `always`, `never` |
 | `days` | `trial_period_days` |
-| `requirePaymentMethod` | từ chối mở trial nếu chưa có thẻ (lỗi 400 kèm lý do) |
+| `requirePaymentMethod` | refuses to start a trial if there is no card yet (400 error with the reason) |
 | `missingPaymentMethodBehavior` | `trial_settings.end_behavior.missing_payment_method` |
 
-Mỗi request `change` còn nhận `withTrial: true/false` để ghi đè policy cho đúng
-lần đó; UI hiện thành checkbox "Start this subscription with a trial".
-`POST /api/subscriptions/:id/end-trial` gửi `trial_end: 'now'` để kết thúc trial
-ngay và xuất hoá đơn kỳ đầu.
+Each `change` request also accepts `withTrial: true/false` to override the policy for that
+single request; the UI shows it as the checkbox "Start this subscription with a trial".
+`POST /api/subscriptions/:id/end-trial` sends `trial_end: 'now'` to end the trial
+immediately and issue the first period's invoice.
 
-Lưu ý một hành vi của Stripe: nếu subscription đang `trialing`, **chưa có thẻ**
-và `missing_payment_method = cancel`, Stripe **từ chối** preview hoá đơn sắp tới
-(vì sẽ không có hoá đơn nào — trial hết là huỷ). App bắt trường hợp này và trả
-về lời giải thích thay vì lỗi.
+Note a Stripe behaviour: if the subscription is `trialing`, **has no card yet**,
+and `missing_payment_method = cancel`, Stripe **refuses** to preview the upcoming invoice
+(because there will be no invoice — the subscription is cancelled when the trial ends). The app catches this case and returns
+an explanation instead of an error.
 
 ## 5. Invoicing
 
 | Field | Stripe |
 |---|---|
 | `collectionMethod` | `collection_method` |
-| `daysUntilDue` | `days_until_due` (chỉ với `send_invoice`) |
-| `billingMode` | `billing_mode.type` — `flexible` (mặc định mới, prorate theo giây) hoặc `classic` |
+| `daysUntilDue` | `days_until_due` (only with `send_invoice`) |
+| `billingMode` | `billing_mode.type` — `flexible` (new default, prorates by the second) or `classic` |
 | `automaticTax` | `automatic_tax.enabled` |
-| `defaultPaymentBehavior` | `payment_behavior` lúc tạo subscription |
+| `defaultPaymentBehavior` | `payment_behavior` when creating the subscription |
 | `anchorToFirstOfMonth` | `billing_cycle_anchor_config.day_of_month = 1` |
 
-`billing_mode` chỉ set được lúc tạo subscription, không đổi được sau đó.
+`billing_mode` can only be set when creating the subscription and cannot be changed afterwards.
 
 ## 6. Refunds
 
-| Field | Tác dụng |
+| Field | Effect |
 |---|---|
-| `windowDays` | quá hạn thì API từ chối, trừ khi gửi `force: true` |
-| `mode: credit_note` | `creditNotes.create({ invoice, amount, refund_amount })` — vừa điều chỉnh hoá đơn (đúng cho thuế/kế toán) vừa hoàn tiền |
-| `mode: refund` | `refunds.create({ payment_intent, amount })` — chỉ chuyển tiền, hoá đơn giữ nguyên |
-| `allowPartial` | bắt buộc hoàn toàn phần hay cho phép một phần |
-| `maxAutoApproveCents` | trần tự động duyệt, vượt trần phải `force: true` |
+| `windowDays` | past the window the API refuses, unless `force: true` is sent |
+| `mode: credit_note` | `creditNotes.create({ invoice, amount, refund_amount })` — both adjusts the invoice (correct for tax/accounting) and refunds the money |
+| `mode: refund` | `refunds.create({ payment_intent, amount })` — only moves money, the invoice stays unchanged |
+| `allowPartial` | require a full refund or allow a partial one |
+| `maxAutoApproveCents` | auto-approval ceiling; above it `force: true` is required |
 
 ## 7. Dunning
 
-`invoice.payment_failed` đến qua webhook. Tuỳ `pastDueBehavior`, app để Stripe
-retry theo Smart Retries (`leave_past_due`), hoặc `subscriptions.cancel`, hoặc
-set `pause_collection` với `pauseBehavior` (`void` / `keep_as_draft` /
+`invoice.payment_failed` arrives via webhook. Depending on `pastDueBehavior`, the app lets Stripe
+retry with Smart Retries (`leave_past_due`), or calls `subscriptions.cancel`, or
+sets `pause_collection` with `pauseBehavior` (`void` / `keep_as_draft` /
 `mark_uncollectible`).
 
 ## 8. Customer Portal
 
-`POST /api/billing/portal/configuration` dựng một
-`billingPortal.configurations` từ policy hiện hành: `subscription_update.
-proration_behavior` lấy từ rule `screensIncrease`, `subscription_cancel.mode`
-lấy từ `cancellation.timing`. Nhờ vậy khách tự thao tác trong portal của Stripe
-vẫn chịu đúng luật như thao tác qua app.
+`POST /api/billing/portal/configuration` builds a
+`billingPortal.configurations` from the current policy: `subscription_update.
+proration_behavior` is taken from the `screensIncrease` rule, `subscription_cancel.mode`
+is taken from `cancellation.timing`. That way a customer acting on their own in Stripe's portal
+is still subject to the same rules as acting through the app.
 
-## 9. Thời gian: luôn hỏi test clock, đừng hỏi đồng hồ máy
+## 9. Time: always ask the test clock, never the machine clock
 
-Account gắn test clock sống trong thời gian mô phỏng. Dùng `Date.now()` cho họ
-sẽ hỏng âm thầm ở ba chỗ: `proration_date` tính từ sai mốc (prorate ra nguyên
-tháng thay vì phần còn lại), cửa sổ refund không bao giờ hết hạn, và phase của
-subscription schedule bị hiểu nhầm là "tương lai". Vì vậy mọi mốc thời gian đều
-đi qua `StripeService.nowFor(testClockId)`.
+An account attached to a test clock lives in simulated time. Using `Date.now()` for it
+breaks silently in three places: `proration_date` is computed from the wrong point (prorating a whole
+month instead of the remainder), the refund window never expires, and a subscription
+schedule phase is misread as "future". So every point in time
+goes through `StripeService.nowFor(testClockId)`.
 
 ## 10. Test clock
 
-Customer được tạo kèm `test_clock`. `POST /api/simulator/:id/advance` gọi
-`testHelpers.testClocks.advance` rồi chờ tới khi `status = ready`. Stripe chạy
-thật toàn bộ engine: xuất hoá đơn gia hạn, quét proration tồn đọng, kích hoạt
-phase đã schedule, bắt đầu dunning nếu thẻ fail.
+Customers are created with a `test_clock`. `POST /api/simulator/:id/advance` calls
+`testHelpers.testClocks.advance` then waits until `status = ready`. Stripe runs
+the whole engine for real: issues renewal invoices, sweeps outstanding prorations, activates
+scheduled phases, starts dunning if the card fails.
 
-## 10b. Đọc hỏng không được coi là "không tồn tại"
+## 10b. A failed read must not be treated as "does not exist"
 
-`change()` quyết định tạo subscription mới dựa vào việc đọc subscription hiện
-tại trả về `null`. Nên một lần đọc **thất bại** (timeout, rate limit, 5xx) mà bị
-nuốt thành `null` sẽ khiến app lặng lẽ tạo subscription thứ hai — khách bị tính
-tiền hai lần, chỉ để lại một dòng WARN.
+`change()` decides to create a new subscription based on reading the current subscription
+returning `null`. So a **failed** read (timeout, rate limit, 5xx) that gets
+swallowed into `null` makes the app silently create a second subscription — the customer is charged
+twice, leaving only a WARN line behind.
 
-Quy tắc: chỉ `resource_missing` / HTTP 404 mới là "không còn"; mọi lỗi khác ném
-`ServiceUnavailableException` kèm thông điệp *nothing was changed — retry in a
-moment*. Stripe client cũng bật `maxNetworkRetries: 3` và `timeout: 40000` để lỗi
-mạng thoáng qua tự được retry.
+Rule: only `resource_missing` / HTTP 404 means "gone"; every other error throws
+`ServiceUnavailableException` with the message *nothing was changed — retry in a
+moment*. The Stripe client also enables `maxNetworkRetries: 3` and `timeout: 40000` so that transient
+network errors are retried automatically.
 
-## 11. Những chỗ Stripe API đã đổi (bản 2026-08-26.dahlia)
+## 11. What changed in the Stripe API (version 2026-08-26.dahlia)
 
-- `current_period_start/end` **không còn** trên object Subscription — nằm trên
-  từng subscription item (`StripeService.periodEnd`).
-- Preview hoá đơn dùng `invoices.createPreview({ subscription_details })`,
-  không còn `invoices.retrieveUpcoming`.
-- Line item không còn cờ `proration` ở cấp cao nhất; nó nằm ở
+- `current_period_start/end` is **no longer** on the Subscription object — it lives on
+  each subscription item (`StripeService.periodEnd`).
+- Invoice preview uses `invoices.createPreview({ subscription_details })`,
+  no longer `invoices.retrieveUpcoming`.
+- Line items no longer have a top-level `proration` flag; it lives at
   `line.parent.subscription_item_details.proration`.
-- PaymentIntent của hoá đơn lấy qua `invoice.payments` (cần `expand`).
-- Phase của subscription schedule **không còn** `iterations`; thay bằng
-  `duration: { interval, interval_count }` (hoặc `end_date`).
-- Không được gửi `proration_date` cùng lúc với `billing_cycle_anchor: 'now'` —
-  Stripe trả lỗi 400; việc dời anchor chính là mốc prorate.
+- An invoice's PaymentIntent is obtained via `invoice.payments` (requires `expand`).
+- Subscription schedule phases **no longer** have `iterations`; replaced by
+  `duration: { interval, interval_count }` (or `end_date`).
+- `proration_date` must not be sent together with `billing_cycle_anchor: 'now'` —
+  Stripe returns a 400 error; moving the anchor is itself the proration point.

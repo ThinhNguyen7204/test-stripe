@@ -1,342 +1,387 @@
-# Quy tắc tính tiền — bản nghiệp vụ
+# Billing rules — business edition
 
-Bản này mô tả **hành vi thực tế** của hệ thống theo cấu hình đang chạy, viết cho
-người không đọc code. Mọi con số trong đây đều đo được từ Stripe test mode, không
-phải tính tay.
+This document describes the **actual behaviour** of the system under the
+configuration currently running, written for people who do not read code. Every
+figure in here was measured in Stripe test mode, not calculated by hand.
 
-Phụ lục cuối file ánh xạ từng quy tắc sang ô cấu hình tương ứng, và nói rõ chỗ
-nào chỉnh trong app, chỗ nào phải vào dashboard Stripe.
+The appendix at the end of the file maps each rule to its corresponding
+configuration field, and states clearly what is adjusted in the app and what has
+to be done in the Stripe dashboard.
 
 ---
 
-> ## 📌 Phạm vi SCIO Portal (MVP)
+> ## 📌 SCIO Portal scope (MVP)
 >
-> Khi migrate sang **SCIO Portal**, chỉ mang sang **Standard plan** và **một X
-> add-on theo MODEL V6** ($20/tháng hoặc $216/năm, quantity cố định 1), chạy cả
-> **tháng và năm**. Tiền của X do Stripe prorate native như mọi item; quota do
-> SCIO quản trên quota month cố định theo lịch (mục 10).
+> When migrating to **SCIO Portal**, only the **Standard plan** and **one X
+> add-on under MODEL V6** ($20/month or $216/year, quantity fixed at 1) are
+> carried over, running on both **monthly and annual** cycles. X's money is
+> prorated natively by Stripe like any other item; quota is managed by SCIO on a
+> quota month anchored to the base plan's billing anchor at first purchase
+> (section 10).
 >
-> Các mục dưới đây đều ghi rõ phần nào **trong** phạm vi MVP, phần nào **ngoài**.
-> Bản chi tiết: **[scio-portal-mvp.md](scio-portal-mvp.md)**.
+> Each section below states clearly which part is **inside** the MVP scope and
+> which part is **outside**. Detailed version: **[scio-portal-mvp.md](scio-portal-mvp.md)**.
 >
-> | Trong MVP | Ngoài MVP |
+> | In MVP | Outside MVP |
 > |---|---|
 > | Standard plan | Pro Plus, Engage |
-> | X Social (một add-on, quantity 1) | Background Music, Video Wall, Wireless Presentation |
-> | Chu kỳ tháng ⇄ năm | Thêm / bớt màn hình |
-> | Mua, huỷ, mua lại X, trial X | Lên / hạ gói ở mức plan |
+> | X Social (one add-on, quantity 1) | Background Music, Video Wall, Wireless Presentation |
+> | Monthly ⇄ annual cycle | Adding / removing screens |
+> | Buy, Cancel, Buy X again, X trial | Upgrading / downgrading at plan level |
 
 ---
 
-## 1. Nguyên tắc xuyên suốt
+## 1. Overarching principle
 
-> **Khách mua thêm thì trả tiền ngay. Khách bớt đi thì tiền ở lại trong tài khoản
-> dưới dạng credit, không chảy ngược về thẻ.**
+> **When the customer buys more, they pay immediately. When the customer reduces,
+> the money stays in the account as credit and does not flow back to the card.**
 
-Hai hệ quả:
+Two consequences:
 
-- Không có khoản nào "ghi nợ để sau trả" — trừ một ngoại lệ là bớt màn hình.
-- Không có tiền rời khỏi Stripe trong luồng tự phục vụ. Muốn hoàn về thẻ thì phải
-  là thao tác tay của CSKH.
+- There is no amount "recorded as owed, to be paid later" — with one exception:
+  removing screens.
+- No money leaves Stripe in the self-service flow. A refund to the card must be a
+  manual action by Customer Support.
 
 ---
 
-## 2. Khách mua thêm
+## 2. Customer buys more
 
-> **MVP:** chỉ còn một đường — **mua X**. Thêm màn hình và lên gói plan không có
-> trong portal. Nguyên tắc *thu ngay, thẻ hỏng thì huỷ thao tác, ngày gia hạn
-> không đổi* áp nguyên cho X: Stripe prorate từ lúc mua tới billing boundary.
-> Riêng quota của X tính theo quota month của SCIO (mục 10).
+> **MVP:** only one path remains — **buying X**. Adding screens and upgrading the
+> plan are not in the portal. The principle *charge immediately, a failing card
+> cancels the operation, the renewal date does not change* applies unchanged to
+> X: Stripe prorates from the purchase time to the billing boundary. X's quota
+> alone is calculated on SCIO's quota month, which starts out equal to the
+> billing month (section 10).
 
-Áp cho **thêm màn hình**, **lên gói cao hơn**, **mua add-on**.
+Applies to **adding screens**, **upgrading to a higher plan**, **buying an add-on**.
 
-- Tính theo **số ngày còn lại của kỳ**, không tính nguyên tháng.
-- Xuất hoá đơn riêng và **trừ thẻ ngay** khi bấm mua.
-- **Ngày gia hạn không đổi.**
-- **Thẻ hỏng thì thao tác bị huỷ** — khách không được dùng thứ chưa trả tiền.
-- Khi lên gói, phần gói cũ chưa dùng được hoàn trước rồi mới tính gói mới, nên
-  khách chỉ trả đúng phần chênh.
+- Calculated on the **number of days remaining in the period**, not a full month.
+- A separate invoice is issued and **the card is charged immediately** when the
+  customer clicks buy.
+- **The renewal date does not change.**
+- **A failing card cancels the operation** — the customer may not use something
+  that has not been paid for.
+- On an upgrade, the unused part of the old plan is refunded first and then the
+  new plan is charged, so the customer pays exactly the difference.
 
-| Tình huống đo thật | Thu ngay |
+| Measured scenario | Charged immediately |
 |---|---|
-| Engage, 2 → 3 màn hình, còn 20/30 ngày | **$20.00** |
-| Standard → Pro Plus, 4 màn hình, còn 20/30 ngày | **$13.33** (hoàn $26.67 + tính $40.00) |
-| Mua 2 licence AeriCast, còn 20/30 ngày | **$26.67** |
+| Engage, 2 → 3 screens, 20/30 days remaining | **$20.00** |
+| Standard → Pro Plus, 4 screens, 20/30 days remaining | **$13.33** (refund $26.67 + charge $40.00) |
+| Buy 2 AeriCast licences, 20/30 days remaining | **$26.67** |
 
 ---
 
-## 3. Khách bớt đi — **không cho giữa kỳ**
+## 3. Customer reduces — **not allowed mid-period**
 
-> **MVP:** luật chặn này không chạm tới X: **huỷ X** là luồng riêng của MODEL V6
-> (mục 10) — xoá item ngay, và chỉ credit phần đã trả nằm sau quotaMonthEnd, nếu có.
-> Hạ gói ở mức plan và bớt màn hình đều không tồn tại trong MVP. Cửa chặn giữ lại
-> cho giai đoạn sau khi portal mở thêm bậc.
+> **MVP:** this blocking rule does not touch X: **Cancel X** is a separate
+> MODEL V6 flow (section 10) — the tenant is frozen immediately, the same item
+> goes from quantity 1 to 0 and is cleaned up at `AlreadyPaidUntil`, and only the
+> paid portion lying after quotaMonthEnd is credited, if any. Plan-level downgrades
+> and removing screens do not exist in the MVP. The block is kept for a later
+> phase when the portal opens up more tiers.
 
-Áp cho **bớt màn hình**, **hạ gói**, **bỏ add-on**.
+Applies to **removing screens**, **downgrading**, **dropping an add-on**.
 
-> Chính sách hiện tại: hệ thống **từ chối** mọi thay đổi khiến công ty phải trả
-> lại tiền cho khách giữa kỳ. Khách đã trả tiền cho cả kỳ thì dùng hết kỳ.
+> Current policy: the system **rejects** any change that would require the
+> company to pay money back to the customer mid-period. A customer who has paid
+> for the whole period uses the whole period.
 
-Cách hoạt động:
+How it works:
 
-- Trước khi gọi Stripe, hệ thống **tính thử** hoá đơn mà thay đổi đó sẽ tạo ra.
-- Nếu số tiền **âm** — tức là phải trả lại khách — thao tác bị **từ chối**, kèm
-  thông báo nêu rõ số tiền.
-- Vì kiểm tra chạy trên bản tính thử, **không có gì bị thay đổi** khi từ chối:
-  gói, số màn hình, add-on, số hoá đơn, credit balance đều nguyên vẹn.
-- **Không bao giờ có hoá đơn âm** trong lịch sử.
+- Before calling Stripe, the system **previews** the invoice that the change
+  would create.
+- If the amount is **negative** — meaning money must be paid back to the
+  customer — the operation is **rejected**, with a message stating the amount.
+- Because the check runs on the preview, **nothing is changed** on rejection:
+  plan, screen count, add-ons, invoice count and credit balance all stay intact.
+- **There is never a negative invoice** in the history.
 
-| Thao tác đo thật (đã dùng 15/30 ngày) | Kết quả |
+| Measured operation (15/30 days used) | Result |
 |---|---|
-| Bớt màn hình 4 → 2 | ❌ từ chối — *"would leave 15.00 USD owed back"* |
-| Hạ gói Pro Plus → Standard | ❌ từ chối — *"would leave 10.00 USD owed back"* |
-| Bỏ 2 add-on về 0 | ❌ từ chối — *"would leave 15.00 USD owed back"* |
-| Lên gói Pro Plus → Engage | ✅ thu ngay $30.00 |
+| Remove screens 4 → 2 | ❌ rejected — *"would leave 15.00 USD owed back"* |
+| Downgrade Pro Plus → Standard | ❌ rejected — *"would leave 10.00 USD owed back"* |
+| Drop 2 add-ons to 0 | ❌ rejected — *"would leave 15.00 USD owed back"* |
+| Upgrade Pro Plus → Engage | ✅ charged immediately $30.00 |
 
-### Vậy khách muốn giảm thì làm sao
+### So how does a customer reduce
 
-Hiện tại **không có đường tự phục vụ**. Ba lựa chọn:
+There is currently **no self-service path**. Three options:
 
-1. **Chờ tới ngày gia hạn** rồi tự đổi — lúc đó không còn phần chưa dùng nên
-   không phát sinh khoản trả lại.
-2. **CSKH can thiệp** — dùng mục *One-off policy override* trên màn hình
-   Subscription, đặt riêng cho lần đó `create_prorations` +
-   `push_to_account_balance`. Thay đổi được áp và khách nhận credit, chỉ áp dụng
-   đúng lần bấm đó, không ảnh hưởng chính sách chung.
-3. **Đổi chính sách** cho rule tương ứng sang `end_of_period` — khi đó thay đổi
-   được đặt lịch, có hiệu lực đúng ngày gia hạn, không ai phải trả lại gì.
+1. **Wait until the renewal date** and change it then — at that point there is no
+   unused portion left, so no payback arises.
+2. **Customer Support intervenes** — using the *One-off policy override* section
+   on the Subscription screen, setting `create_prorations` +
+   `push_to_account_balance` for that one time only. The change is applied and
+   the customer receives credit; it applies only to that exact click and does
+   not affect the general policy.
+3. **Change the policy** for the corresponding rule to `end_of_period` — the
+   change is then scheduled and takes effect exactly on the renewal date, and
+   nobody has to pay anything back.
 
-> **Cân nhắc nghiệp vụ:** chặn hoàn toàn nghĩa là khách đang gặp khó khăn tài
-> chính không thể tự giảm chi tiêu, phải liên hệ hỗ trợ. Đổi lại, công ty không
-> bao giờ phải trả lại tiền giữa kỳ và sổ sách không có hoá đơn âm.
+> **Business consideration:** blocking completely means a customer in financial
+> difficulty cannot reduce their spending themselves and has to contact support.
+> In return, the company never has to pay money back mid-period and the books
+> contain no negative invoices.
 
-## 4. Đổi chu kỳ thanh toán
+## 4. Changing the billing cycle
 
-> **MVP: trong phạm vi.** X đang ACTIVE thì **cả plan lẫn X cùng nhảy**, Stripe
-> prorate native cả hai; SCIO giữ Used và chỉ cộng delta dương nếu thời gian đã
-> trả tăng. X đang FROZEN thì chỉ gói nền đổi.
+> **MVP: in scope.** When X is ACTIVE, **both the plan and X switch together**,
+> and Stripe prorates both natively; SCIO keeps Used and only adds a positive
+> delta if the paid time increases. Stripe restarts billing from today, but the
+> quota month **keeps its anchor**, so from then on the two cycles run apart.
+> When X is FROZEN, only the base plan changes.
 
-**Tháng → Năm** (khách muốn rẻ hơn 10%)
-- Chu kỳ **tính lại từ hôm nay**; ngày gia hạn mới là hôm nay + 1 năm.
-- Thu ngay tiền cả năm, **trừ phần tháng chưa dùng**.
-- Đo thật: Engage 1 màn hình, mới dùng 1 ngày → thu **$294.00** ($324 − $30).
+**Monthly → Annual** (the customer wants a 10% saving)
+- The cycle is **recalculated from today**; the new renewal date is today + 1 year.
+- The full year is charged immediately, **minus the unused part of the month**.
+- Measured: Engage 1 screen, used for only 1 day → charged **$294.00** ($324 − $30).
 
-**Năm → Tháng** (khách muốn giảm cam kết)
-- Có hiệu lực **ngay**, không bắt chờ hết năm.
-- Phần năm chưa dùng thành **credit**, tháng đầu của gói tháng được tính trong
-  cùng lần đó.
-- Credit thường đủ nuôi vài tháng tiếp theo.
-- Đo thật: Pro Plus 2 màn hình, gói năm $324, đổi sau 2 tháng → credit
-  **$240.74**, hoàn về thẻ **$0.00**, hoá đơn tháng kế tiếp **$0.00**.
-
----
-
-## 5. Huỷ
-
-> **MVP: trong phạm vi.** **Huỷ plan** (hạ về Free) có hiệu lực cuối kỳ đã trả,
-> X chạy tới mốc đó rồi kết thúc cùng plan. **Huỷ riêng X** thì khác — có hiệu
-> lực **ngay**, xem mục 10.
-
-- Huỷ **vào cuối kỳ đã trả tiền** — khách xài hết những gì đã mua, nên **không có
-  gì để hoàn**.
-- Huỷ xong tài khoản **rơi về gói Free**, giữ tối đa 3 màn hình, không bị khoá sạch.
-- Đổi ý trước ngày hết hạn thì hoàn tác được.
-- Có tuỳ chọn huỷ ngay lập tức. Nếu bật thì **phải bật kèm "tính lại phần chưa
-  dùng"**, không thì khách vừa mất dịch vụ vừa không được gì — trang Billing
-  policy sẽ cảnh báo nếu rơi vào trạng thái này.
+**Annual → Monthly** (the customer wants to reduce commitment)
+- Takes effect **immediately**, without waiting for the year to end.
+- The unused part of the year becomes **credit**, and the first month of the
+  monthly plan is charged in the same operation.
+- The credit usually covers the next several months.
+- Measured: Pro Plus 2 screens, annual plan $324, switched after 2 months →
+  credit **$240.74**, refunded to card **$0.00**, next month's invoice **$0.00**.
 
 ---
 
-## 6. Dùng thử
+## 5. Cancel
 
-> **MVP: trong phạm vi.** Trial của plan mô tả dưới đây **đã dựng**.
+> **MVP: in scope.** **Cancelling the plan** (dropping to Free) takes effect at
+> the end of the paid period; X runs until that point and then ends together
+> with the plan. **Cancelling X alone** is different — it takes effect
+> **immediately**, see section 10.
+
+- Cancel **at the end of the paid period** — the customer uses up everything
+  they bought, so **there is nothing to refund**.
+- After cancelling, the account **drops to the Free plan**, keeping up to 3
+  screens, and is not locked out entirely.
+- A change of mind before the expiry date can be undone.
+- There is an option to cancel immediately. If it is enabled, **"recalculate the
+  unused portion" must be enabled with it**, otherwise the customer both loses
+  the service and gets nothing back — the Billing policy page warns if this
+  state occurs.
+
+---
+
+## 6. Trial
+
+> **MVP: in scope.** The plan trial described below **has been built**.
 >
-> **Trial của X add-on — đã dựng** (MODEL V6 row 50): 14 ngày, 200 Post Updates
-> trong ledger riêng, một lần mỗi account, chỉ Manual Refresh, không có Stripe
-> item. Xem mục 10.
+> **X add-on trial — built** (MODEL V6 row 50): 14 days, 200 Post Updates in a
+> separate ledger, once per account, Manual Refresh only, no Stripe item. See
+> section 10.
 
-- **14 ngày**, chỉ cho khách **chưa gắn thẻ**. Ai đã gắn thẻ thì tính tiền ngay
-  từ đầu.
-- Trong trial mọi thay đổi có hiệu lực ngay nhưng **không thu đồng nào**.
-- Hết trial mà chưa có thẻ → **subscription bị huỷ**.
-- Có thể **kết thúc trial sớm**: hệ thống chốt luôn và xuất hoá đơn kỳ đầu tiên.
-- Người vận hành ép bật/tắt trial cho từng lần tạo được, không phụ thuộc quy tắc chung.
-
----
-
-## 7. Thu tiền thất bại
-
-- **Lúc mua thêm:** chặn luôn, không cho dùng trước trả sau.
-- **Lúc gia hạn:** hoá đơn chuyển sang quá hạn, Stripe tự retry theo lịch cấu hình
-  trong dashboard, subscription giữ nguyên. App hiện cảnh báo trên màn hình tài khoản.
-- **Lúc giảm quy mô:** không bị chặn, vì không cần charge.
-- **Tạm dừng theo mùa:** dừng xuất hoá đơn mà không mất cấu hình, mở lại bất cứ lúc nào.
+- **14 days**, only for customers **without a card attached**. Anyone who has
+  attached a card is charged from the start.
+- During the trial every change takes effect immediately but **nothing is charged**.
+- Trial ends without a card → **the subscription is cancelled**.
+- The trial can be **ended early**: the system settles immediately and issues the
+  first period's invoice.
+- The operator can force the trial on/off for each individual creation,
+  independent of the general rules.
 
 ---
 
-## 8. Hoàn tiền về thẻ (thao tác tay của CSKH)
+## 7. Failed payments
 
-Đây là con đường **duy nhất** tiền rời khỏi Stripe.
-
-- Chỉ hoàn được hoá đơn **đã thanh toán**.
-- Phát hành **credit note** — vừa chỉnh hoá đơn cho đúng sổ sách/thuế, vừa chuyển
-  tiền về thẻ.
-- **Cửa sổ 30 ngày** kể từ ngày lập hoá đơn; quá hạn bị từ chối, muốn vượt phải
-  tick ô ghi đè.
-- **Trần tự động duyệt $500**; trên mức đó phải ghi đè thủ công.
-- Cho phép hoàn một phần.
-- Không hoàn quá số thực còn lại — hệ thống trừ cả phần đã hoàn trước đó.
+- **When buying more:** blocked outright; no use-now-pay-later.
+- **On renewal:** the invoice becomes past due, Stripe retries automatically on
+  the schedule configured in the dashboard, and the subscription stays as it is.
+  The app shows a warning on the account screen.
+- **When scaling down:** not blocked, because no charge is needed.
+- **Seasonal pause:** stops issuing invoices without losing the configuration,
+  and can be resumed at any time.
 
 ---
 
-## 9. Ràng buộc hệ thống không cho vi phạm
+## 8. Refunds to the card (manual Customer Support action)
 
-> **MVP:** ràng buộc quan trọng nhất là **phải có subscription trả phí mới mua
-> được add-on**. Gói nền đang trial thì cũng chưa mua được X.
+This is the **only** path by which money leaves Stripe.
 
-- **Add-on phải có gói trả phí đỡ bên dưới** — ít nhất 1 màn hình. Không có
-  subscription thì không mua được add-on nào, kể cả X.
-- Gói **Free tối đa 3 màn hình**, **không được dùng add-on**.
-- Add-on tính theo màn hình (Background Music, AeriCast) **không được nhiều hơn
-  số màn hình**.
-- Mỗi gói có số màn hình tối thiểu riêng.
-- Cho phép **giảm về 0 màn hình** để tạm dừng theo mùa.
+- Only **paid** invoices can be refunded.
+- A **credit note** is issued — it both adjusts the invoice so the books/tax are
+  correct and moves the money back to the card.
+- **30-day window** from the invoice date; past that it is rejected, and
+  exceeding it requires ticking the override box.
+- **Auto-approval ceiling $500**; above that a manual override is required.
+- Partial refunds are allowed.
+- No refund beyond the amount actually remaining — the system deducts any
+  previously refunded amount as well.
+
+---
+
+## 9. Constraints the system does not allow to be violated
+
+> **MVP:** the most important constraint is that **a paid subscription is
+> required to buy an add-on**. While the base plan is on trial, X cannot be
+> bought yet either.
+
+- **An add-on must have a paid plan underneath it** — at least 1 screen. Without
+  a subscription no add-on can be bought, including X.
+- The **Free plan allows at most 3 screens** and **may not use add-ons**.
+- Per-screen add-ons (Background Music, AeriCast) **may not exceed the number of
+  screens**.
+- Each plan has its own minimum number of screens.
+- **Reducing to 0 screens** is allowed for a seasonal pause.
 
 ---
 
 ## 10. X Social — MODEL V6
 
-> **MVP: đây là phần lõi của portal.** Bản đầy đủ kèm số đo thật:
-> **[scio-portal-mvp.md](scio-portal-mvp.md)**. Code: `backend/src/x-addon/`.
+> **MVP: this is the core of the portal.** The full version with measured
+> figures: **[scio-portal-mvp.md](scio-portal-mvp.md)**. Code: `backend/src/x-addon/`.
 
-Một add-on duy nhất mỗi tenant, **quantity cố định 1**, **$20/tháng hoặc
-$216/năm**, 2.000 Post Updates cho mỗi quota month trả đủ. Không còn tier
-Standard/Pro và không còn quantity (V6 row 48).
+A single add-on per tenant, **quantity fixed at 1**, **$20/month or
+$216/year**, 2,000 Post Updates for each fully paid quota month. There is no
+longer a Standard/Pro tier and no longer a quantity (V6 row 48). **Quantity 0**
+is only a technical state after Cancel: the same item is kept at 0 until
+`AlreadyPaidUntil` so that buying again is not double-charged, and is then
+cleaned up — it is not a second commercial plan (V6 row 51, EASY 5).
 
-### Hai đồng hồ
+### Two clocks
 
-- **Tiền là của Stripe**: X là một item thường, cùng subscription / thẻ /
-  interval với gói nền, **prorate native**. Không còn phép tính tay theo hạn mức.
-- **Quota là của SCIO**: quota month cố định `[ngày 1, ngày 1 tháng sau)` UTC.
-  `Granted = floor(2.000 × thời gian đã trả trong tháng / độ dài tháng)`, đọc lại
-  từ các dòng X trên hoá đơn **đã paid**, lấy hợp các khoảng — không cấp trùng
-  khi đổi interval, chỉ tăng chứ không giảm, không reset Used, không rollover.
+- **Money belongs to Stripe**: X is an ordinary item, on the same subscription /
+  card / interval as the base plan, **prorated natively**. There is no longer
+  any manual calculation based on allowance.
+- **Quota belongs to SCIO**: the quota month is stepped in whole months from a
+  per-tenant **quota anchor** (`account.xAddon.quotaAnchor`) — the base plan's
+  billing anchor at the moment X is first bought, so at first the quota month **is**
+  the billing month (billed on the 10th → 10/09 → 10/10). The day is clamped like
+  Stripe's (31/01 → 28/02 → 31/03). A base-plan interval change restarts billing
+  but never moves the anchor, so from then on the two cycles run apart; a FROZEN
+  tenant keeps its anchor, and buying X again after quotaMonthEnd re-anchors to the
+  base plan's current billing cycle.
+  `Granted = floor(2,000 × paid time in the month / length of the month)`, read
+  back from the X lines on **paid** invoices, taking the union of the intervals —
+  no double grant when changing interval, it only increases and never decreases,
+  Used is not reset, no rollover.
 
-### Vòng đời
+### Lifecycle
 
 | | Stripe | SCIO |
 |---|---|---|
-| Mua | prorate tới billing boundary, thu ngay; thẻ hỏng → không có gì | reservation 2.000 trước khi gọi Stripe; paid → commit + grant |
-| Renewal | thu kỳ mới | cộng delta còn thiếu vào cùng ledger |
-| Huỷ X | xoá item ngay; nếu `quotaMonthEnd < xPaidThrough` thì credit `quotaMonthEnd → xPaidThrough` vào balance, ngược lại không credit — như nhau cho tháng và năm | FROZEN tới hết quota month, tắt fan-out, trả reservation, giữ FrozenRemaining |
-| Mua lại X | không có nút khôi phục; re-add như một lần mua, không thu trùng tới `min(oldPaidThrough, quotaMonthEnd)`, debit lại phần đã credit | trước quotaMonthEnd → khôi phục FrozenRemaining; từ quotaMonthEnd → kích hoạt mới |
-| Đổi interval | native cùng gói nền (chỉ khi X ACTIVE) | giữ Used, delta dương nếu có |
-| Gói nền về Free / kết thúc | cuối kỳ gói nền | X ENDED cùng gói nền |
-| Payment fail | không có coverage mới | qua paidThrough thì dừng fetch; trả được thì cộng delta |
+| Buy | prorate to the billing boundary, charge immediately; failing card → nothing happens | reservation of 2,000 before calling Stripe; paid → commit + grant |
+| Renewal | charge the new period | with aligned cycles, open the next quota month at 2,000 with Used 0; once the cycles run apart, add the missing delta to the same ledger |
+| Cancel X | same item quantity 1 → 0, not deleted immediately; if `quotaMonthEnd < xPaidThrough` then credit `quotaMonthEnd → xPaidThrough` to the balance, otherwise no credit — the same for monthly and annual. With aligned cycles a monthly Cancel never has anything to credit; a credit arises only on annual, or after an interval change | FROZEN until the end of the quota month, fan-out turned off, reservation released, FrozenRemaining kept |
+| Cleanup | at `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)` delete the quantity-0 item with no-proration; retry for up to 24 hours then alert | only if still FROZEN, still quantity 0, and no purchase in progress |
+| Buy X again | there is no restore button; it is a purchase — before `AlreadyPaidUntil` the same item goes 0 → 1 with `proration_date = AlreadyPaidUntil`, no double charge, the credited portion is debited back; from then on it prorates normally from the purchase time | before `AlreadyPaidUntil` → restore FrozenRemaining; from then on → new activation (re-anchored to the base plan's current billing cycle once past quotaMonthEnd) |
+| Change interval | native together with the base plan (only when X is ACTIVE); Stripe restarts billing | quota anchor unchanged; keep Used, positive delta if any |
+| Base plan to Free / ended | end of the base plan's period | X ENDED together with the base plan |
+| Payment fail | no new coverage | past paidThrough, fetching stops; once paid, the delta is added |
 
-### Trừ quota
+### Quota deduction
 
-Theo số Post X **thực trả về và tính phí**, clamp bởi Remaining, exactly-once
-theo `actionId`. Initial / Auto / Manual dùng chung một số dư. Hết quota thì
-không gọi provider, không tính overage.
+Based on the number of X Posts **actually returned and billed**, clamped by
+Remaining, exactly-once per `actionId`. Initial / Auto / Manual share one
+balance. When quota runs out, the provider is not called and no overage is
+charged.
 
-### Mô phỏng trong demo
+### Simulation in the demo
 
-Khối **X add-on** ở cột trái: status, quota month, Granted / Used / Remaining,
-paidThrough, capacity, các nút *Cancel X* / *Buy X again* / *Start 14-day trial*, và
-ô **Provider fetch** (chọn Initial/Auto/Manual, nhập *asked* và *returned*) đóng
-vai X API. API: `/api/x-addon/:id` và `/api/x-addon/:id/sync-runs`.
+The **X add-on** block in the left column: status, quota month, Granted / Used /
+Remaining, paidThrough, capacity, the *Cancel X* / *Buy X again* / *Start 14-day
+trial* buttons, and the **Provider fetch** box (choose Initial/Auto/Manual, enter
+*asked* and *returned*) which plays the role of the X API. API:
+`/api/x-addon/:id` and `/api/x-addon/:id/sync-runs`.
 
-Capacity chỉnh ở tab **Billing policy** → Constraints
+Capacity is adjusted in the **Billing policy** tab → Constraints
 (`xCommercialCeilingUnits`, `xProviderHardCapUnits`).
 
 ---
 
-## Phụ lục A — Ánh xạ sang ô cấu hình
+## Appendix A — Mapping to configuration fields
 
-Chỉnh ở tab **Billing policy** trong app. Mọi thay đổi lưu ngay và nhãn preset
-chuyển thành `custom`.
+Adjusted in the **Billing policy** tab in the app. Every change is saved
+immediately and the preset label switches to `custom`.
 
-| Quy tắc | timing | proration | anchor | payment | credit |
+| Rule | timing | proration | anchor | payment | credit |
 |---|---|---|---|---|---|
-| Thêm màn hình | immediate | `always_invoice` | unchanged | `error_if_incomplete` | — |
-| Lên gói | immediate | `always_invoice` | unchanged | `error_if_incomplete` | — |
-| Mua add-on | immediate | `always_invoice` | unchanged | `error_if_incomplete` | — |
-| Bớt màn hình | immediate | `always_invoice` | unchanged | `error_if_incomplete` | **`block`** |
-| Hạ gói | immediate | `always_invoice` | unchanged | `error_if_incomplete` | **`block`** |
-| Bỏ add-on | immediate | `always_invoice` | unchanged | `error_if_incomplete` | **`block`** |
-| Tháng → Năm | immediate | `always_invoice` | **now** | `error_if_incomplete` | — |
-| Năm → Tháng | immediate | `always_invoice` | **now** | `error_if_incomplete` | `push_to_account_balance` |
+| Add screens | immediate | `always_invoice` | unchanged | `error_if_incomplete` | — |
+| Upgrade | immediate | `always_invoice` | unchanged | `error_if_incomplete` | — |
+| Buy add-on | immediate | `always_invoice` | unchanged | `error_if_incomplete` | — |
+| Remove screens | immediate | `always_invoice` | unchanged | `error_if_incomplete` | **`block`** |
+| Downgrade | immediate | `always_invoice` | unchanged | `error_if_incomplete` | **`block`** |
+| Drop add-on | immediate | `always_invoice` | unchanged | `error_if_incomplete` | **`block`** |
+| Monthly → Annual | immediate | `always_invoice` | **now** | `error_if_incomplete` | — |
+| Annual → Monthly | immediate | `always_invoice` | **now** | `error_if_incomplete` | `push_to_account_balance` |
 
-Ngoài các luật chung, còn một tầng **override theo từng add-on** (`addOnRules`,
-theo code của add-on). X Social **không** dùng tầng này: mua, huỷ và mua lại của
-nó do MODEL V6 chốt cứng trong `backend/src/x-addon/x-addon.service.ts`.
+Besides the general rules, there is also a **per-add-on override** layer
+(`addOnRules`, keyed by the add-on's code). X Social does **not** use this layer:
+its buy, cancel and buy-again behaviour is settled by MODEL V6 and hard-coded in
+`backend/src/x-addon/x-addon.service.ts`.
 
-**Bốn cách xử lý khi thay đổi sinh ra khoản phải trả lại khách:**
+**Four ways to handle a change that produces an amount owed back to the customer:**
 
-| Giá trị | Hành vi | Có hoá đơn âm không |
+| Value | Behaviour | Negative invoice? |
 |---|---|---|
-| `block` | **đang dùng** — từ chối thao tác, không thay đổi gì | không |
-| `push_to_account_balance` | cho đổi, credit hiện ngay trên account balance | tuỳ proration |
-| `customer_balance` | cho đổi, credit nằm ẩn dưới dạng điều chỉnh treo | tuỳ proration |
-| `refund_to_payment_method` | cho đổi, hoàn tiền thật về thẻ | có thể |
+| `block` | **in use** — rejects the operation, changes nothing | no |
+| `push_to_account_balance` | allows the change, credit appears immediately on the account balance | depends on proration |
+| `customer_balance` | allows the change, credit sits hidden as a pending adjustment | depends on proration |
+| `refund_to_payment_method` | allows the change, real refund to the card | possibly |
 
-Hoá đơn âm chỉ sinh ra khi `proration_behavior = always_invoice` **và** số tiền
-ra âm. Với `block` thì trường hợp đó bị chặn trước, nên không bao giờ xảy ra.
-Với `create_prorations` thì Stripe không chốt sổ nên cũng không có hoá đơn nào.
+A negative invoice is only produced when `proration_behavior = always_invoice`
+**and** the amount comes out negative. With `block` that case is blocked
+beforehand, so it never happens. With `create_prorations` Stripe does not settle
+the books, so there is no invoice either.
 
-| Nhóm khác | Giá trị hiện tại |
+| Other group | Current value |
 |---|---|
-| Huỷ | cuối kỳ · không prorate · về gói Free (không có gì để trả lại) |
-| Trial | 14 ngày · chỉ khi chưa có thẻ · hết trial không thẻ thì huỷ |
-| Hoá đơn | thu tự động bằng thẻ · engine prorate theo giây · không tính thuế tự động |
-| Hoàn tiền | credit note · cửa sổ 30 ngày · trần tự duyệt $500 · cho hoàn một phần |
-| Ràng buộc | ép số lượng tối thiểu · **add-on cần gói trả phí** · add-on ≤ màn hình · Free ≤ 3 màn hình · cho về 0 |
-| Allowance | X Standard 600 · X Pro 2.000 Monthly Post Updates — sửa được lúc chạy |
-| Thu thất bại | để Stripe tự retry · tạm dừng kiểu `void` |
+| Cancel | end of period · no proration · to the Free plan (nothing to pay back) |
+| Trial | 14 days · only without a card · trial ends without a card → cancel |
+| Invoice | automatic card collection · per-second proration engine · no automatic tax |
+| Refund | credit note · 30-day window · auto-approval ceiling $500 · partial refunds allowed |
+| Constraint | enforce minimum quantity · **add-on requires a paid plan** · add-on ≤ screens · Free ≤ 3 screens · allow 0 |
+| Allowance | X Social: 2,000 Post Updates per fully paid quota month (MODEL V6 row 4) — editable at runtime |
+| Failed payment | let Stripe retry automatically · pause in `void` mode |
 
 ---
 
-## Phụ lục B — Chỉnh ở đâu
+## Appendix B — Where to adjust
 
-### Chỉ chỉnh được trong app này
+### Only adjustable in this app
 
-Những thứ dưới đây là **tham số của từng lời gọi API**, Stripe không có màn hình
-nào để set mặc định:
+The items below are **parameters of each individual API call**; Stripe has no
+screen to set defaults for them:
 
-- Prorate hay không, và prorate xong thu ngay hay để dành (`proration_behavior`)
-- Áp ngay hay chờ cuối kỳ
-- Có reset chu kỳ thanh toán không (`billing_cycle_anchor`)
-- Thẻ hỏng thì chặn hay cho qua (`payment_behavior`)
-- Credit đi đâu: balance / hoàn thẻ / thu hồi
-- Toàn bộ quy tắc trial, cửa sổ hoàn tiền, trần tự duyệt, và mọi ràng buộc gói
+- Whether to prorate, and after prorating whether to charge immediately or hold
+  it (`proration_behavior`)
+- Apply immediately or wait until the end of the period
+- Whether to reset the billing cycle (`billing_cycle_anchor`)
+- Whether a failing card blocks or lets it through (`payment_behavior`)
+- Where credit goes: balance / refund to card / clawback
+- All trial rules, the refund window, the auto-approval ceiling, and every plan
+  constraint
 
-### Phải vào dashboard Stripe
+### Must be done in the Stripe dashboard
 
-| Việc | Vị trí trong dashboard |
+| Task | Location in the dashboard |
 |---|---|
-| Lịch retry khi thu tiền hỏng, và làm gì sau lần retry cuối | Settings → Billing → Subscriptions and emails |
-| Email gửi khách: biên lai, báo thu hỏng, nhắc gia hạn | Settings → Billing → Subscriptions and emails |
-| Giao diện hoá đơn: logo, màu, số hiệu, memo, footer | Settings → Billing → Invoices |
-| Đăng ký thuế để tính thuế tự động | Settings → Tax |
-| Loại phương thức thanh toán chấp nhận | Settings → Payment methods |
-| Card updater, thu hồi doanh thu | Settings → Billing → Revenue recovery |
+| Retry schedule for failed payments, and what to do after the final retry | Settings → Billing → Subscriptions and emails |
+| Emails to customers: receipts, failed-payment notices, renewal reminders | Settings → Billing → Subscriptions and emails |
+| Invoice appearance: logo, colours, numbering, memo, footer | Settings → Billing → Invoices |
+| Tax registration for automatic tax calculation | Settings → Tax |
+| Accepted payment method types | Settings → Payment methods |
+| Card updater, revenue recovery | Settings → Billing → Revenue recovery |
 
-### Cả hai nơi, app ghi đè
+### Both places, the app overrides
 
-| Việc | Ghi chú |
+| Task | Notes |
 |---|---|
-| **Customer Portal** | Dashboard có cấu hình mặc định, nhưng app tạo cấu hình riêng từ billing policy và dùng cấu hình đó. Bấm *Sync portal config* trong app để đẩy sang. |
-| **Sản phẩm và bảng giá** | Sửa được trong dashboard, nhưng app là nguồn chân lý — chạy sync sẽ ghi đè tên/mô tả và tạo Price mới nếu giá lệch. Đừng sửa giá trực tiếp trên dashboard. |
+| **Customer Portal** | The dashboard has a default configuration, but the app creates its own configuration from the billing policy and uses that one. Click *Sync portal config* in the app to push it across. |
+| **Products and price list** | Editable in the dashboard, but the app is the source of truth — running sync overwrites names/descriptions and creates a new Price if the price differs. Do not edit prices directly in the dashboard. |
 
-### Nằm trong code, không có UI
+### In code, no UI
 
-| Việc | File |
+| Task | File |
 |---|---|
-| Bảng giá gốc: gói, giá, add-on, ràng buộc số lượng | `backend/src/catalog/catalog.constants.ts` |
-| Giá trị mặc định và 5 preset | `backend/src/policy/policy.presets.ts` |
-| Danh sách lựa chọn hiện trên dropdown | `backend/src/policy/policy.fields.ts` |
-| Quy tắc phát hiện cấu hình vô hiệu | `backend/src/policy/policy.service.ts` |
+| Base price list: plans, prices, add-ons, quantity constraints | `backend/src/catalog/catalog.constants.ts` |
+| Default values and the 5 presets | `backend/src/policy/policy.presets.ts` |
+| List of options shown in dropdowns | `backend/src/policy/policy.fields.ts` |
+| Rules for detecting invalid configurations | `backend/src/policy/policy.service.ts` |
 
-Cấu hình đang chạy lưu trong MongoDB, collection `billing_policies`, một document
-duy nhất. Sửa trên UI là ghi thẳng vào đó, không cần deploy lại.
+The running configuration is stored in MongoDB, collection `billing_policies`, a
+single document. Editing in the UI writes straight to it, with no redeploy needed.

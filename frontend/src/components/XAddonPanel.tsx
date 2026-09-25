@@ -13,7 +13,8 @@ const STATUS_TONE: Record<string, string> = {
 
 /**
  * The X add-on as MODEL V6 has it: one add-on per tenant, a SCIO quota ledger
- * on a fixed calendar quota month, granted by paid time. The sync-run box is a
+ * on a quota month stepped from the billing anchor at first purchase, granted
+ * by paid time. The sync-run box is a
  * stand-in for the provider — it spends what X "returned and billed", the way
  * the time machine stands in for the calendar.
  */
@@ -92,6 +93,15 @@ export default function XAddonPanel({ accountId, state, run, busy }: any) {
             <dd>{day(x.frozen.until)}</dd>
           </div>
         )}
+        {x.parkedItem && (
+          <div>
+            <dt>Stripe item</dt>
+            <dd title="Cancel keeps the same item at quantity 0 so buying X again does not charge twice (MODEL V6 rows 49, 59)">
+              quantity 0 until {day(x.parkedItem.alreadyPaidUntil)} · then cleaned up
+              {x.parkedItem.cleanupError ? ` · retrying: ${x.parkedItem.cleanupError}` : ''}
+            </dd>
+          </div>
+        )}
         <div>
           <dt>Capacity</dt>
           <dd>
@@ -145,7 +155,7 @@ export default function XAddonPanel({ accountId, state, run, busy }: any) {
             }
             title={
               x.repurchase.kind === 'restores_frozen_remaining'
-                ? 'Restores FrozenRemaining until quota month end'
+                ? 'Same item 0 → 1; restores FrozenRemaining until quota month end'
                 : 'New activation — the old quota expired'
             }
           >
@@ -161,8 +171,8 @@ export default function XAddonPanel({ accountId, state, run, busy }: any) {
       {x.repurchase && (
         <p className="hint">
           {x.repurchase.kind === 'restores_frozen_remaining'
-            ? `There is no separate restore. Buying X again before ${day(x.quotaMonth?.end)} restores the frozen Remaining, which still expires then. `
-            : 'The quota month it was cancelled in is over — buying X again is a new activation. '}
+            ? `There is no separate restore. Buying X again before ${day(x.repurchase.alreadyPaidUntil)} puts the same item back from quantity 0 to 1 and restores the frozen Remaining, which still expires on ${day(x.quotaMonth?.end)}. `
+            : `AlreadyPaidUntil (${day(x.repurchase.alreadyPaidUntil)}) has passed — buying X again is a new activation${x.repurchase.reusesItemId ? ' on the same quantity-0 item' : ' on a new item'}. `}
           {x.repurchase.prorationBehavior === 'none'
             ? 'Nothing is charged now: this time is already paid.'
             : `Stripe charges from ${day(x.repurchase.chargesFrom)} to ${day(x.repurchase.chargesTo)}.`}

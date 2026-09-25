@@ -1,73 +1,78 @@
-# Mô hình billing của OptiSigns (tham khảo)
+# OptiSigns billing model (reference)
 
-Tài liệu này ghi lại cách OptiSigns thật sự bán hàng và tính tiền — là cơ sở cho
-các mặc định trong app demo.
+This document records how OptiSigns actually sells and bills — it is the basis
+for the defaults in the demo app.
 
-## 1. Đơn vị tính tiền: mỗi màn hình là một licence
+## 1. Billing unit: each screen is one licence
 
-Mọi gói trả phí đều tính **per screen / per month**. Số màn hình chính là
-`quantity` của subscription item trên Stripe. Thêm màn hình = tăng quantity,
-bớt màn hình = giảm quantity.
+Every paid plan is billed **per screen / per month**. The number of screens is
+exactly the `quantity` of the subscription item on Stripe. Adding screens =
+increasing quantity, removing screens = decreasing quantity.
 
-## 2. Bảng giá (USD)
+## 2. Price list (USD)
 
-Đối chiếu trực tiếp trên optisigns.com/pricing ngày 17/09/2026, cả hai chế độ
-Monthly và Annual.
+Checked directly against optisigns.com/pricing on 17/09/2026, in both Monthly
+and Annual modes.
 
-| Gói | Monthly | Annual (−10%) | Ghi chú |
+| Plan | Monthly | Annual (−10%) | Notes |
 |---|---|---|---|
-| Free | $0 | — | tối đa 3 màn hình, 25 app cơ bản, 1GB, tối đa 3 user, có logo OptiSigns |
-| Standard | $10.00 | $9.00 | playlist, lịch phát, 100+ app, unlimited storage, tối đa 25 user |
-| Pro Plus *(Most Popular)* | $15.00 | $13.50 | M365/Google Workspace, dashboard, OptiSync, workflow, SAML SSO, unlimited user |
-| Engage | $30.00 | $27.00 | kiosk tương tác, Lift & Learn, Check-In, QR scan, analytics theo sự kiện |
-| Enterprise | $45.00 | $40.50 | **tối thiểu 25 màn hình**, "Talk With Sales", CSM riêng, GraphQL API, on-premise |
+| Free | $0 | — | up to 3 screens, 25 basic apps, 1GB, up to 3 users, OptiSigns logo shown |
+| Standard | $10.00 | $9.00 | playlists, schedules, 100+ apps, unlimited storage, up to 25 users |
+| Pro Plus *(Most Popular)* | $15.00 | $13.50 | M365/Google Workspace, dashboards, OptiSync, workflows, SAML SSO, unlimited users |
+| Engage | $30.00 | $27.00 | interactive kiosks, Lift & Learn, Check-In, QR scan, event-based analytics |
+| Enterprise | $45.00 | $40.50 | **minimum 25 screens**, "Talk With Sales", dedicated CSM, GraphQL API, on-premise |
 
-> **Không có gói "Pro".** Bảng giá hiện tại chỉ có 5 bậc kể trên. Nếu gặp tài
-> liệu nào nhắc tới "Pro $12.50" thì đó là thông tin cũ/sai.
+> **There is no "Pro" plan.** The current price list has only the 5 tiers listed
+> above. Any document that mentions "Pro $12.50" contains old/incorrect
+> information.
 
-Add-on (licence riêng, đi kèm subscription của gói nền):
+Add-ons (separate licences, attached to the base plan's subscription):
 
-| Add-on | Đơn vị | Monthly | Annual |
+| Add-on | Unit | Monthly | Annual |
 |---|---|---|---|
-| Video Wall | mỗi wall | $25.00 | $22.50 |
-| Background Music | mỗi screen | $15.00 | $13.50 |
-| Wireless Presentation | mỗi screen | $20.00 | $18.00 |
-| Ads Portal | — | liên hệ sales | — |
+| Video Wall | per wall | $25.00 | $22.50 |
+| Background Music | per screen | $15.00 | $13.50 |
+| Wireless Presentation | per screen | $20.00 | $18.00 |
+| Ads Portal | — | contact sales | — |
 
-Term annual giảm đúng 10% ở mọi tier (kể cả add-on); giá annual được trình bày
-theo "mỗi màn hình mỗi tháng, billed annually" nhưng **thu một lần cho 12
-tháng**. Trang pricing còn có bộ chọn tiền tệ (USD/EUR/GBP/AUD/CAD).
+The annual term is exactly 10% cheaper at every tier (add-ons included); annual
+prices are presented as "per screen per month, billed annually" but are
+**charged once for 12 months**. The pricing page also has a currency selector
+(USD/EUR/GBP/AUD/CAD).
 
-### Phạm vi được dựng trong app demo
+### Scope built in the demo app
 
-App demo dựng **Free + Standard + Pro Plus + Engage** cùng cả 3 add-on.
-Enterprise bị lược bỏ vì là kênh sales ("Talk With Sales"), không self-serve;
-muốn thêm lại chỉ cần một entry trong `backend/src/catalog/catalog.constants.ts`
-(`minQuantity: 25` sẽ tự được enforce).
+The demo app builds **Free + Standard + Pro Plus + Engage** together with all 3
+add-ons. Enterprise is omitted because it is a sales channel ("Talk With Sales"),
+not self-serve; adding it back only takes one entry in
+`backend/src/catalog/catalog.constants.ts` (`minQuantity: 25` will be enforced
+automatically).
 
 ## 3. Trial
 
-14 ngày, không cần thẻ. Hết trial mà chưa có thẻ thì tài khoản bị deactivate và
-có thể kích hoạt lại ở gói Free. AeriCast có trial riêng 14 ngày với 2 licence.
+14 days, no card required. If the trial ends without a card, the account is
+deactivated and can be reactivated on the Free plan. AeriCast has its own
+14-day trial with 2 licences.
 
-## 4. Proration — điểm cốt lõi
+## 4. Proration — the core point
 
-### Tăng quy mô: prorate rồi **thu ngay**
+### Scaling up: prorate, then **charge immediately**
 
-Đây là hành vi production, **xác nhận nội bộ** (mentor team OptiSigns): khi khách
-mua thêm — thêm màn hình, lên gói, mua add-on — hệ thống tính prorate cho phần
-thời gian còn lại của kỳ và **charge ngay tại thời điểm mua**, không chờ hoá đơn
-kỳ sau.
+This is production behaviour, **confirmed internally** (OptiSigns mentor team):
+when the customer buys more — adds screens, upgrades, buys an add-on — the system
+prorates for the remaining time in the period and **charges immediately at the
+time of purchase**, without waiting for the next period's invoice.
 
-Trong Stripe tương ứng với `proration_behavior: 'always_invoice'`. App demo dùng
-đúng cấu hình này cho cả ba rule `screensIncrease` / `planUpgrade` /
-`addOnIncrease`, kèm `payment_behavior: 'error_if_incomplete'` để thẻ hỏng thì
-thay đổi bị huỷ chứ không cho dùng trước trả sau.
+In Stripe this corresponds to `proration_behavior: 'always_invoice'`. The demo
+app uses exactly this configuration for all three rules `screensIncrease` /
+`planUpgrade` / `addOnIncrease`, together with
+`payment_behavior: 'error_if_incomplete'` so that a failing card cancels the
+change rather than allowing use-now-pay-later.
 
-### Cảnh báo: bài support công khai mô tả khác, và mô tả sai
+### Warning: the public support article describes it differently, and describes it wrongly
 
-Bài [What if I want to increase, decrease number of screens during the
-month?](https://support.optisigns.com/hc/en-us/articles/360016219114) viết:
+The article [What if I want to increase, decrease number of screens during the
+month?](https://support.optisigns.com/hc/en-us/articles/360016219114) says:
 
 > "Our system will prorate the usage and automatically adjust your **next bill**
 > with the correct amount."
@@ -79,24 +84,25 @@ month?](https://support.optisigns.com/hc/en-us/articles/360016219114) viết:
 >
 > Totaled: $36.66 on Mar 10th.
 
-**Đừng dùng đoạn này làm chuẩn nghiệm thu.** Ba vấn đề:
+**Do not use this passage as an acceptance standard.** Three problems:
 
-1. **Thời điểm thu sai so với production** — bài viết nói dồn vào hoá đơn kỳ sau,
-   thực tế thu ngay lúc mua.
-2. **Con số $6.66 là làm tròn kiểu "tháng 30 ngày"** ($10 × 20/30). Chu kỳ
-   10/01 → 10/02 dài **31 ngày**, thêm màn hình ngày 20/01 thì còn **21 ngày**,
-   nên Stripe tính $10 × 21/31 = **$6.77**, tổng **$36.77**. Đã dựng lại đúng
-   ví dụ này trên Stripe test mode để đối chiếu.
-3. **Hai lỗi biên tập**: "On Feb 10th you will get billed" nhưng kết luận
-   "Totaled $36.66 on **Mar 10th**"; và dòng prorate ghi khoảng "Jan 20th -
-   **Mar 10**" trong khi đoạn 10/02 → 10/03 đã nằm ở dòng trên — viết vậy là
-   tính trùng một tháng.
+1. **The charge timing differs from production** — the article says it is rolled
+   into the next period's invoice; in reality it is charged immediately at
+   purchase.
+2. **The $6.66 figure is "30-day month" rounding** ($10 × 20/30). The cycle
+   10/01 → 10/02 is **31 days** long; adding a screen on 20/01 leaves **21 days**,
+   so Stripe charges $10 × 21/31 = **$6.77**, total **$36.77**. This exact
+   example was rebuilt in Stripe test mode for comparison.
+3. **Two editorial errors**: "On Feb 10th you will get billed" but the conclusion
+   says "Totaled $36.66 on **Mar 10th**"; and the prorated line states the range
+   "Jan 20th - **Mar 10**" while the 10/02 → 10/03 stretch is already on the line
+   above — written that way, one month is counted twice.
 
-### Stripe tách prorate làm hai dòng, không phải một
+### Stripe splits proration into two lines, not one
 
-Điều tài liệu không nói: Stripe không "cộng thêm một màn hình". Nó huỷ toàn bộ
-phần chưa dùng của số lượng cũ rồi tính lại số lượng mới cho cùng khoảng thời
-gian. Với ví dụ trên:
+What the documentation does not say: Stripe does not "add one more screen". It
+cancels the entire unused portion of the old quantity and then recharges the new
+quantity for the same time span. For the example above:
 
 ```
 [prorate] Unused time on 2 × Standard     -$13.55   20/01 → 10/02
@@ -104,36 +110,40 @@ gian. Với ví dụ trên:
           3 × Standard ($10.00 / month)    $30.00   10/02 → 10/03
 ```
 
-Hiệu hai dòng prorate = $6.77, đúng bằng một màn hình cho 21 ngày.
+The difference between the two prorated lines = $6.77, exactly one screen for 21
+days.
 
-### Giảm quy mô: credit, không hoàn tiền mặt
+### Scaling down: credit, not a cash refund
 
 > "the system will automatically calculate and give you credit to the next bill
 > for the unused portion of the canceled screens for the month."
 
-Phần chưa dùng thành credit, không chuyển tiền về thẻ. App demo dùng
-`create_prorations` + `push_to_account_balance` để credit đó hiện ngay trên
-`customer.balance` thay vì nằm ẩn dưới dạng pending invoice item.
+The unused portion becomes credit; money is not moved back to the card. The demo
+app uses `create_prorations` + `push_to_account_balance` so that the credit
+appears immediately on `customer.balance` instead of sitting hidden as a pending
+invoice item.
 
-## 5. Huỷ và tạm dừng
+## 5. Cancel and pause
 
-- Huỷ bằng cách giảm licence về 0 hoặc bấm huỷ ở trang Subscription Plan; tài
-  khoản luôn có thể kích hoạt lại.
-- Use case theo mùa: đưa màn hình vào thư mục **OnHold** (không chiếm slot) rồi
-  giảm licence — tương đương `pause_collection` trên Stripe.
-- Tài liệu OptiSigns không nêu chính sách hoàn tiền theo tỉ lệ khi huỷ giữa kỳ;
-  mặc định là phần còn lại trở thành credit, không phải tiền mặt.
+- Cancel by reducing licences to 0 or by clicking Cancel on the Subscription Plan
+  page; the account can always be reactivated.
+- Seasonal use case: move screens into the **OnHold** folder (they do not occupy
+  a slot) and then reduce licences — equivalent to `pause_collection` on Stripe.
+- The OptiSigns documentation does not state a pro-rata refund policy for
+  mid-period cancellation; the default is that the remainder becomes credit, not
+  cash.
 
 ## 6. Return policy
 
-Return policy công khai áp cho hàng hoá: cửa sổ **30 ngày** kể từ ngày mua, hàng
-phải còn nguyên trạng, có thể chọn full refund / store credit / exchange, phí
-ship trả hàng do khách chịu (dùng nhãn trả sẵn thì trừ $10). Chính sách này
-không phân biệt hardware với subscription và không nói tới prorated refund cho
-gói năm — nên trong demo, cửa sổ 30 ngày được dùng làm mặc định cho refund
-subscription và có thể chỉnh trong billing policy.
+The public return policy applies to physical goods: a **30-day** window from the
+purchase date, goods must be in original condition, the customer can choose full
+refund / store credit / exchange, and return shipping is paid by the customer
+(using the prepaid return label deducts $10). This policy does not distinguish
+hardware from subscriptions and says nothing about prorated refunds for annual
+plans — so in the demo, the 30-day window is used as the default for subscription
+refunds and can be adjusted in the billing policy.
 
-## Nguồn
+## Sources
 
 - https://www.optisigns.com/pricing
 - https://support.optisigns.com/hc/en-us/articles/1500000493782-Billing-How-Do-I-Change-my-Subscription-Plan

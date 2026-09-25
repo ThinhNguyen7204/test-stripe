@@ -1,25 +1,25 @@
 # OptiSigns Billing Demo — NestJS + React + Stripe + MongoDB
 
-App demo mô phỏng cơ chế subscription + add-on của OptiSigns, với **toàn bộ luật
-tính tiền, prorate, downgrade và hoàn tiền là cấu hình chạy được** — sửa policy
-là đổi hành vi thật của Stripe.
+A demo app that simulates OptiSigns' subscription + add-on mechanics, where **all
+the charging, proration, downgrade and refund rules are runnable configuration** —
+editing the policy changes Stripe's real behaviour.
 
-| Thành phần | Port |
+| Component | Port |
 |---|---|
 | Backend (NestJS) | `3123` |
 | Frontend (React + Vite) | `5555` |
 | MongoDB | `27099` |
 
-Đọc thêm:
-- [`docs/scio-integration-context.md`](docs/scio-integration-context.md) — **context bàn giao** để mang cơ chế này sang SCIO Portal
-- [`docs/business-rules.md`](docs/business-rules.md) — **quy tắc tính tiền bằng ngôn ngữ nghiệp vụ** (bắt đầu từ đây)
-- [`docs/scio-portal-mvp.md`](docs/scio-portal-mvp.md) — phạm vi mang sang **SCIO Portal**: Standard plan + X add-on
-- [`docs/optisigns-billing-model.md`](docs/optisigns-billing-model.md) — OptiSigns tính tiền thế nào (kèm nguồn)
-- [`docs/stripe-mapping.md`](docs/stripe-mapping.md) — từng nút vặn ánh xạ sang tham số Stripe nào
+Further reading:
+- [`docs/scio-integration-context.md`](docs/scio-integration-context.md) — **handover context** for bringing these mechanics into the SCIO Portal
+- [`docs/business-rules.md`](docs/business-rules.md) — **charging rules in business language** (start here)
+- [`docs/scio-portal-mvp.md`](docs/scio-portal-mvp.md) — scope carried over to the **SCIO Portal**: Standard plan + X add-on
+- [`docs/optisigns-billing-model.md`](docs/optisigns-billing-model.md) — how OptiSigns charges (with sources)
+- [`docs/stripe-mapping.md`](docs/stripe-mapping.md) — which Stripe parameter each knob maps to
 
 ---
 
-## 1. Chạy
+## 1. Running
 
 ### MongoDB (port 27099)
 
@@ -31,9 +31,9 @@ mongod --port 27099 --dbpath ./.mongo-data
 
 ```bash
 cd backend
-cp .env.example .env     # rồi điền STRIPE_SECRET_KEY (sk_test_...)
+cp .env.example .env     # then fill in STRIPE_SECRET_KEY (sk_test_...)
 npm install
-npm run build && npm start      # hoặc: npm run dev
+npm run build && npm start      # or: npm run dev
 ```
 
 ### Frontend
@@ -44,309 +44,325 @@ npm install
 npm run dev
 ```
 
-Mở http://localhost:5555
+Open http://localhost:5555
 
-### Đẩy bảng giá lên Stripe
+### Push the price list to Stripe
 
 ```bash
 node scripts/seed.mjs
 ```
 
-Hoặc bấm **Sync catalog → Stripe** trên UI. Script idempotent: price được so
-khớp bằng `lookup_key` nên chạy lại không tạo trùng.
+Or click **Sync catalog → Stripe** in the UI. The script is idempotent: prices are
+matched by `lookup_key`, so re-running it creates no duplicates.
 
-### Webhook (tuỳ chọn nhưng nên có)
+### Webhook (optional but recommended)
 
 ```bash
 stripe listen --forward-to localhost:3123/api/webhooks/stripe
 ```
 
-Dán `whsec_...` vào `STRIPE_WEBHOOK_SECRET`. Không có secret thì endpoint vẫn
-nhận payload chưa ký (tiện cho demo local).
+Paste the `whsec_...` into `STRIPE_WEBHOOK_SECRET`. Without a secret the endpoint
+still accepts unsigned payloads (handy for a local demo).
 
-### Kiểm thử toàn bộ vòng đời
+### Testing the full lifecycle
 
 ```bash
-node scripts/verify.mjs               # thêm --keep để giữ lại account trong Stripe
-node scripts/verify-x-v6.mjs          # X add-on theo MODEL V6 (chạy riêng, không song song)
-node scripts/test-x-quota.mjs         # phép tính quota V6, không cần Stripe (build backend trước)
+node scripts/verify.mjs               # add --keep to keep the account in Stripe
+node scripts/verify-x-v6.mjs          # X add-on per MODEL V6 (run on its own, not in parallel)
+node scripts/test-x-quota.mjs         # V6 quota arithmetic, no Stripe needed (build the backend first)
 ```
 
-Script đi hết 15 bước: trial → subscribe → thêm màn hình (prorate) → add-on →
-ràng buộc add-on ≤ màn hình → bớt màn hình (credit) → downgrade có refund về thẻ
-→ đổi sang annual → downgrade theo lịch → refund hoá đơn → guard rail refund →
-tua đồng hồ tới kỳ gia hạn → pause/resume → huỷ ngay có prorate → audit log.
-Backend phải đang chạy; script tự tạo rồi tự xoá account demo (dùng `--keep`
-để giữ lại mà soi trong Stripe dashboard).
+The script walks all 15 steps: trial → subscribe → add screens (prorate) → add-on →
+add-on ≤ screens constraint → remove screens (credit) → downgrade with refund to card
+→ switch to annual → scheduled downgrade → invoice refund → refund guard rail →
+advance the clock to the renewal → pause/resume → immediate Cancel with prorate → audit log.
+The backend must be running; the script creates and then deletes the demo account itself (use `--keep`
+to keep it for inspection in the Stripe dashboard).
 
 ---
 
-## 2. Bảng giá được mô phỏng
+## 2. Simulated price list
 
-Giá lấy từ optisigns.com/pricing (đối chiếu cả Monthly lẫn Annual ngày
-17/09/2026). Gói tính **theo màn hình / tháng**, annual giảm đúng 10% và thu
-trọn 12 tháng:
+Prices are taken from optisigns.com/pricing (both Monthly and Annual checked on
+17/09/2026). Plans are charged **per screen / month**; annual is exactly 10% off and
+collects the full 12 months:
 
-| Gói | Monthly | Annual | Ghi chú |
+| Plan | Monthly | Annual | Notes |
 |---|---|---|---|
-| Free | $0 | — | tối đa 3 màn hình, không tạo Stripe subscription |
-| Standard | $10.00 | $9.00 | tối đa 25 user |
-| Pro Plus | $15.00 | $13.50 | Most Popular · unlimited user |
-| Engage | $30.00 | $27.00 | kiosk tương tác |
+| Free | $0 | — | up to 3 screens, no Stripe subscription created |
+| Standard | $10.00 | $9.00 | up to 25 users |
+| Pro Plus | $15.00 | $13.50 | Most Popular · unlimited users |
+| Engage | $30.00 | $27.00 | interactive kiosk |
 
-Add-on nằm chung subscription, cùng term với gói nền:
+Add-ons live on the same subscription, with the same term as the base plan:
 
-| Add-on | Đơn vị | Monthly | Annual |
+| Add-on | Unit | Monthly | Annual |
 |---|---|---|---|
 | Video Wall | wall | $25.00 | $22.50 |
 | Background Music | screen | $15.00 | $13.50 |
 | Wireless Presentation | screen | $20.00 | $18.00 |
 
-**X Social** theo **MODEL V6**: mỗi tenant **tối đa 1 add-on, quantity cố định
-bằng 1**, không còn tier Standard/Pro:
+**X Social** follows **MODEL V6**: each tenant has **at most 1 add-on, with quantity fixed
+at 1**; there are no longer Standard/Pro tiers:
 
 | Add-on | Monthly | Annual | Quota |
 |---|---|---|---|
-| X Social | $20.00 | $216.00 ($20 × 12 × 90%) | 2.000 Post Updates / quota month trả đủ |
+| X Social | $20.00 | $216.00 ($20 × 12 × 90%) | 2,000 Post Updates / fully paid quota month |
 
-Có **hai đồng hồ độc lập** (V6 row 6):
+There are **two clocks** (V6 row 6):
 
-- **Tiền là của Stripe.** X là một item bình thường trên cùng subscription,
-  cùng thẻ, cùng interval với gói nền, và được **Stripe prorate native**. Mua
-  giữa kỳ thì trả phần kỳ còn lại, thu ngay (`always_invoice` +
-  `error_if_incomplete`), thẻ hỏng thì không có gì thay đổi.
-- **Quota là của SCIO**, tính trên **quota month cố định theo lịch UTC**
-  (`[ngày 1 00:00, ngày 1 tháng sau)`), không theo ngày billing của Stripe:
+- **Money belongs to Stripe.** X is an ordinary item on the same subscription,
+  same card, same interval as the base plan, and is **prorated natively by Stripe**. Buying
+  mid-period pays for the remainder of the period, collected immediately (`always_invoice` +
+  `error_if_incomplete`); if the card fails, nothing changes.
+- **Quota belongs to SCIO**, computed over a **quota month stepped in whole months from a
+  per-tenant quota anchor** (`account.xAddon.quotaAnchor`). The anchor is the base plan's
+  `billing_cycle_anchor` at the moment X is first bought, so the quota month starts out **equal to
+  the billing month** (billed on the 10th → 10/09 → 10/10); the day is clamped like Stripe's
+  (31/01 → 28/02 → 31/03). A base-plan interval change restarts Stripe's billing
+  (`billing_cycle_anchor=now`) but **never moves the quota anchor**, so from then on the two
+  cycles can run apart:
 
 ```
-GrantedTarget(Q) = floor(2.000 × giây đã trả tiền nằm trong Q / số giây của Q)
+GrantedTarget(Q) = floor(2,000 × paid seconds falling within Q / number of seconds in Q)
 Remaining        = max(0, Granted − Used)
 ```
 
-Thời gian đã trả tiền đọc lại từ **các dòng X trên hoá đơn đã `paid`** (chưa
-`invoice.paid` thì chưa có quota) và lấy **hợp** các khoảng, nên đổi Monthly →
-Yearly không bao giờ cấp trùng. Renewal hay đổi interval **không reset Used**,
-chỉ cộng phần delta dương. Gói năm vẫn cấp theo từng quota month (1.733 +
-11 × 2.000 + 267 = 24.000 cho kỳ 05/09 → 05/09, tháng cuối được true-up).
+Paid time is read back from **the X lines on `paid` invoices** (no
+`invoice.paid` means no quota yet) and takes the **union** of the intervals, so switching Monthly →
+Yearly never grants twice. Renewal or an interval change **does not reset Used**;
+it only adds the positive delta; no rollover. The yearly plan still grants per quota month:
+with aligned cycles a paid year is 12 whole quota months of 2,000 = 24,000 (yearly bought 05/09 →
+quota months on the 5th, 2,000 each).
 
-| Thao tác | Tiền (Stripe) | Quota (SCIO) |
+> **Operator decision, 2026-09-25.** Anchoring the quota month to the base plan's billing anchor
+> departs from the example in MODEL V6 row 46, which reads the quota month as the calendar month
+> (the 1st at 00:00 UTC). Row 47's second example (129 + 266) and row 59's credit example are
+> therefore not reproduced: bought 30/08 on a base billed on the 5th now measures **387** in one
+> quota month 05/08 → 05/09, and a Monthly Cancel on the 20th credits nothing.
+
+| Action | Money (Stripe) | Quota (SCIO) |
 |---|---|---|
-| Mua giữa quota month | prorate tới billing boundary, thu ngay | `floor(2.000 × phần đã trả / tháng)` — mua 15/09, trả tới 01/10 → **1.066** |
-| Renewal giữa quota month | Stripe thu kỳ mới | cộng phần còn thiếu vào **cùng** ledger (580 → +1.420 = 2.000) |
-| Monthly ⇄ Yearly (X đang ACTIVE) | native proration cùng gói nền | giữ Used, chỉ tăng nếu coverage tăng |
-| **Cancel X** | xoá item **ngay**, cả Monthly lẫn Yearly: nếu `quotaMonthEnd < xPaidThrough` thì `proration_date = quotaMonthEnd` → credit `quotaMonthEnd → xPaidThrough` vào customer balance; ngược lại `proration_behavior=none`, không credit. Không bao giờ credit phần quota month đang chạy | **FROZEN** tới quotaMonthEnd, tắt fan-out, giải phóng capacity; FrozenRemaining được giữ |
-| **Mua lại X** trước quotaMonthEnd | **không có nút khôi phục riêng** — bật X lại là một lần mua; không thu trùng tới `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)`, phần đã credit thì debit lại đúng mốc đó | khôi phục **FrozenRemaining** (Granted/Used như cũ) sau khi payment thành công, vẫn hết hạn tại quotaMonthEnd |
-| Mua lại X từ quotaMonthEnd trở đi | như mua mới, Stripe prorate bình thường | quota cũ hết hạn, tháng mới cấp theo paid coverage |
-| Hạ gói nền về Free | cuối kỳ đã trả, không prorate | X chạy tới boundary rồi ENDED cùng gói nền |
-| Payment fail | không có coverage mới | chỉ dùng phần đã grant, qua paidThrough thì dừng fetch; trả được thì cộng delta |
+| Buy mid quota month | prorate to the billing boundary, collected immediately | `floor(2,000 × paid portion / month)` — base billed on the 1st, buy 15/09, paid through 01/10 → **1,066**; bought 10/09 on a base billed on the 10th → the full **2,000** for 10/09 → 10/10 |
+| Renewal | Stripe collects the new period | with aligned cycles the renewal opens the next quota month at **2,000**, Used 0; once the cycles run apart, any shortfall is added to the **same** ledger |
+| Monthly ⇄ Yearly (X is ACTIVE) | native proration together with the base plan; Stripe restarts billing | the quota anchor does not move; keep Used, only increase if coverage increases |
+| **Cancel X** | **keep the same item, quantity 1 → 0** (not deleted immediately), for both Monthly and Yearly: if `quotaMonthEnd < xPaidThrough` then `proration_date = quotaMonthEnd` → credit `quotaMonthEnd → xPaidThrough` to the customer balance; otherwise `proration_behavior=none`, no credit. Never credit the part of the quota month in progress. With aligned cycles a Monthly Cancel has no future coverage (`quotaMonthEnd = xPaidThrough`); a credit arises only on Yearly, or after an interval change has moved billing away from the quota cycle | **FROZEN** until quotaMonthEnd, fan-out off, capacity released; FrozenRemaining is kept; store `AlreadyPaidUntil = min(oldPaidThrough, quotaMonthEnd)` |
+| **Cleanup** at `AlreadyPaidUntil` | delete the quantity-0 item with `proration_behavior=none` — no money moves anywhere; retry on error, alert after 24 hours | only runs when the item is still quantity 0, the tenant is still FROZEN and no purchase is in progress (locked per tenant) |
+| **Buy X again** before `AlreadyPaidUntil` | **no separate restore button** — turning X back on is a purchase; **same item 0 → 1** with `proration_date = AlreadyPaidUntil`: no double charge, whatever was credited is debited back at exactly that point | restore **FrozenRemaining** (Granted/Used as before) after payment succeeds, still expires at quotaMonthEnd |
+| Buy X again from `AlreadyPaidUntil` onward | new activation, Stripe prorates normally from the time of purchase — reuses the quantity-0 item if cleanup has not run, otherwise creates a new item | that month's quota is granted per paid coverage; after quotaMonthEnd (CANCELED) the new activation re-anchors to the base plan's **current** billing cycle |
+| Downgrade the base plan to Free | at the end of the paid period, no prorate | X runs until the boundary, then ENDED together with the base plan |
+| Payment fail | no new coverage | only the already granted amount is usable; fetching stops past paidThrough; once paid, the delta is added |
 
-**Trial X** (row 50): 14 ngày, 200 Post Updates trong ledger riêng, một lần mỗi
-account, **chỉ Manual Refresh**, không có Stripe item. Mua add-on thì trial kết
-thúc, số dư trial không chuyển sang.
+**Trial X** (row 50): 14 days, 200 Post Updates in a separate ledger, once per
+account, **Manual Refresh only**, no Stripe item. Buying the add-on ends the trial;
+the trial balance does not carry over.
 
-**Trừ quota** (row 12): theo số Post X **thực trả về và tính phí** — hỏi 50, X
-trả 12 thì trừ 12 — clamp bởi Remaining, **exactly-once** theo `actionId`. Hết
-quota thì không gọi provider nữa, không tính overage.
+**Quota deduction** (row 12): by the number of X Posts **actually returned and billed** — ask for 50, X
+returns 12, deduct 12 — clamped by Remaining, **exactly-once** per `actionId`. When the
+quota runs out the provider is no longer called, and no overage is charged.
 
-**Capacity admission** (row 17): trước khi gọi Stripe, tenant giữ một
-reservation 2.000 (TTL 15 phút); `Committed + Pending + 2.000 ≤ 2.500.000` mới
-được bán; paid thì commit, fail/hết hạn thì release. 500.000 còn lại tới hard cap
-3.000.000 là buffer không bán. Đổi interval không reserve thêm.
+**Capacity admission** (row 17): before calling Stripe, the tenant holds a
+2,000 reservation (TTL 15 minutes); it can be sold only if `Committed + Pending + 2,000 ≤ 2,500,000`;
+paid commits it, fail/expiry releases it. The remaining 500,000 up to the hard cap of
+3,000,000 is an unsold buffer. Changing the interval reserves nothing extra.
 
-**Enterprise** ($45.00 / $40.50, tối thiểu 25 màn hình) là kênh "Talk With
-Sales" nên không dựng trong demo self-serve này — thêm lại bằng một entry trong
-[`catalog.constants.ts`](backend/src/catalog/catalog.constants.ts). Bảng giá
-OptiSigns **không có gói "Pro"**.
+**Enterprise** ($45.00 / $40.50, minimum 25 screens) is a "Talk With
+Sales" channel, so it is not built in this self-serve demo — add it back with one entry in
+[`catalog.constants.ts`](backend/src/catalog/catalog.constants.ts). The OptiSigns
+price list **has no "Pro" plan**.
 
-Ràng buộc được enforce ở backend: `minQuantity` của gói, Free ≤ 3 màn hình và
-không add-on, add-on tính theo màn hình không vượt quá số màn hình.
+Constraints enforced in the backend: the plan's `minQuantity`, Free ≤ 3 screens and
+no add-ons, per-screen add-ons cannot exceed the number of screens.
 
 ---
 
-## 3. Cấu hình cơ chế ở đâu
+## 3. Where the mechanics are configured
 
-Tab **Billing policy** trong UI (hoặc `GET/PUT /api/policy`) chỉnh:
+The **Billing policy** tab in the UI (or `GET/PUT /api/policy`) adjusts:
 
-- **8 change rule** — `screensIncrease`, `screensDecrease`, `planUpgrade`,
+- **8 change rules** — `screensIncrease`, `screensDecrease`, `planUpgrade`,
   `planDowngrade`, `addOnIncrease`, `addOnDecrease`, `termToYearly`,
-  `termToMonthly`. Mỗi rule có `timing`, `prorationBehavior`,
+  `termToMonthly`. Each rule has `timing`, `prorationBehavior`,
   `billingCycleAnchor`, `paymentBehavior`, `creditHandling`.
-  `creditHandling` có 5 giá trị: `customer_balance` (để nguyên chỗ Stripe đặt),
-  `push_to_account_balance` (luôn hiện thành account credit),
-  `refund_to_payment_method` (hoàn về thẻ), `none` (thu hồi credit),
-  `block` (**từ chối** thao tác nếu nó khiến công ty phải trả lại tiền).
-- **Per-add-on override** (`addOnRules`) — đè rule riêng cho từng add-on theo
-  code. X Social **không** đi qua đây: mua / huỷ / mua lại của nó do MODEL V6
-  chốt cứng trong `backend/src/x-addon/`.
-- **Cancellation** — huỷ cuối kỳ hay huỷ ngay, có prorate không, phần chưa dùng
-  thành credit hay hoàn về thẻ.
-- **Trial** — `appliesTo` (`only_without_payment_method` như OptiSigns / `always` /
-  `never`), số ngày, `requirePaymentMethod`, xử lý khi hết trial mà không có thẻ.
-  Mỗi lần tạo subscription còn có checkbox riêng để bật/tắt trial cho lần đó,
-  và nút **End trial now** để kết thúc trial giữa chừng (`trial_end: 'now'`).
+  `creditHandling` has 5 values: `customer_balance` (leave it where Stripe put it),
+  `push_to_account_balance` (always shown as account credit),
+  `refund_to_payment_method` (refund to card), `none` (claw back the credit),
+  `block` (**reject** the action if it would make the company pay money back).
+- **Per-add-on override** (`addOnRules`) — overrides rules for each add-on by
+  code. X Social does **not** go through here: its buy / Cancel / buy again flows are hard-wired
+  by MODEL V6 in `backend/src/x-addon/`.
+- **Cancellation** — Cancel at period end or Cancel immediately, with or without prorate, whether the unused portion
+  becomes credit or is refunded to the card.
+- **Trial** — `appliesTo` (`only_without_payment_method` like OptiSigns / `always` /
+  `never`), number of days, `requirePaymentMethod`, handling when the trial ends without a card.
+  Each subscription creation also has its own checkbox to turn the trial on/off for that time,
+  and an **End trial now** button to end the trial midway (`trial_end: 'now'`).
 - **Invoicing** — `collection_method`, `days_until_due`, `billing_mode`
-  (flexible/classic), automatic tax, `payment_behavior`, neo kỳ về ngày 1.
-- **Refunds** — cửa sổ ngày, credit note hay refund thuần, cho phép refund một
-  phần, trần tự động duyệt.
-- **Constraints** — min/max số lượng, quan hệ add-on ↔ màn hình, cho phép về 0
-  màn hình, **add-on bắt buộc phải có subscription trả phí** mới mua được, và
-  capacity của X (`xCommercialCeilingUnits`, `xProviderHardCapUnits`).
-- **Dunning** — làm gì khi `invoice.payment_failed`, `pause_collection.behavior`.
+  (flexible/classic), automatic tax, `payment_behavior`, anchor the period to day 1.
+- **Refunds** — day window, credit note or plain refund, allow partial
+  refunds, auto-approval ceiling.
+- **Constraints** — min/max quantity, add-on ↔ screen relationship, allow going down to 0
+  screens, **add-ons require a paid subscription** before they can be bought, and
+  X capacity (`xCommercialCeilingUnits`, `xProviderHardCapUnits`).
+- **Dunning** — what to do on `invoice.payment_failed`, `pause_collection.behavior`.
 
-### 6 preset dựng sẵn
+### 6 built-in presets
 
-| Preset | Hành vi |
+| Preset | Behaviour |
 |---|---|
-| `scio_portal_mvp` | **Phạm vi migrate sang SCIO Portal**: Standard plan + X Social (MODEL V6), tháng hoặc năm. Hạ gói nền về Free có hiệu lực cuối kỳ đã trả; X chạy tới boundary đó |
-| `optisigns_default` | Mọi credit ở lại trong Stripe dưới dạng **account credit**, không refund về thẻ. Prorate dồn vào hoá đơn kỳ sau; riêng **yearly → monthly áp dụng ngay** và phần năm chưa dùng thành credit |
-| `charge_immediately` | Mọi thay đổi xuất hoá đơn và thu tiền ngay |
-| `annual_commitment` | Upgrade ngay, mọi thao tác giảm — kể cả yearly → monthly — phải chờ tới kỳ gia hạn (subscription schedule), không hoàn tiền |
-| `customer_friendly` | Giảm quy mô thì phát hành credit note và hoàn tiền về thẻ |
-| `no_proration` | `proration_behavior=none` toàn bộ: đổi số lượng ngay, tiền đổi ở kỳ sau |
+| `scio_portal_mvp` | **Scope migrated to the SCIO Portal**: Standard plan + X Social (MODEL V6), monthly or yearly. Downgrading the base plan to Free takes effect at the end of the paid period; X runs until that boundary |
+| `optisigns_default` | All credit stays in Stripe as **account credit**, never refunded to the card. Proration rolls into the next period's invoice; only **yearly → monthly applies immediately**, and the unused part of the year becomes credit |
+| `charge_immediately` | Every change is invoiced and collected immediately |
+| `annual_commitment` | Upgrades are immediate; every reduction — including yearly → monthly — waits for the renewal (subscription schedule), no refund |
+| `customer_friendly` | Scaling down issues a credit note and refunds to the card |
+| `no_proration` | `proration_behavior=none` everywhere: quantities change immediately, money changes next period |
 
-Ngoài ra mỗi thao tác có thể **override một lần** (mục "One-off policy override"
-trong UI, hoặc field `overrides` khi gọi API) để so sánh hai hành vi cạnh nhau
-mà không cần đổi policy chung.
+In addition, each action can be **overridden once** (the "One-off policy override" section
+in the UI, or the `overrides` field when calling the API) to compare two behaviours side by side
+without changing the global policy.
 
 ---
 
-## 4. Demo theo kịch bản
+## 4. Scripted demos
 
-1. **Thêm màn hình thu tiền ngay** — tạo account có test clock, gắn thẻ test,
-   mua Engage 2 màn hình. Tua +10 ngày, tăng lên 3 màn hình: Stripe xuất hoá đơn
-   `subscription_update` **$20.00** ($30 × 20/30 ngày còn lại) và thu luôn, ngày
-   gia hạn giữ nguyên — khớp hành vi production của OptiSigns. Đổi
-   `screensIncrease.prorationBehavior` sang `create_prorations` để thấy hành vi
-   dồn vào hoá đơn kỳ sau (đây là điều bài support công khai mô tả, nhưng đã lỗi
-   thời — xem [docs/optisigns-billing-model.md](docs/optisigns-billing-model.md)).
-2. **Credit khi bớt màn hình** — giảm về 2 màn hình: account credit tăng lên
-   (hiển thị ở sidebar), hoá đơn kỳ sau tự trừ.
-3a. **Lên gói thu tiền ngay** — Standard → Pro Plus giữa kỳ: một hoá đơn
-   `subscription_update` gồm phần cũ chưa dùng (âm) + phần mới còn lại (dương),
-   thu đúng chênh lệch. Ngày gia hạn giữ nguyên.
-3b. **Mua add-on thu tiền ngay** — thêm AeriCast giữa kỳ: Stripe xuất hoá đơn
-   riêng cho phần prorate và thu luôn, ngày gia hạn không đổi. Đổi sang thẻ
-   `charge_fails` rồi mua tiếp để thấy `error_if_incomplete` chặn thẳng.
-3. **Hoàn tiền thật khi downgrade** — đổi preset sang `customer_friendly`, lặp
-   lại thao tác giảm: app phát hiện credit vừa sinh, hoàn về thẻ và ghi bút
-   toán ngược để không cấn hai lần.
-4. **Đổi monthly → yearly** — `billing_cycle_anchor: now`, chu kỳ reset, Stripe
-   thu trọn 12 tháng ngay và trừ phần tháng chưa dùng.
-4b. **Đổi yearly → monthly** — mặc định áp ngay: Stripe xuất hoá đơn gồm phần năm
-   chưa dùng (âm) + tháng monthly đầu (dương), phần dư **ròng** thành account
-   credit (`−$240.74`), tiền không rời Stripe. Preset `annual_commitment` cho
-   hành vi chờ hết năm; `customer_friendly` cho hành vi hoàn thẳng về thẻ.
-5. **Downgrade chờ cuối kỳ** — preset `annual_commitment`, hạ gói: app tạo
-   subscription schedule, plan hiện tại giữ nguyên tới hết kỳ, tab Subscription
-   hiện "Scheduled change".
-6. **Tua thời gian** — nút *Next renewal* trong Time machine: Stripe xuất hoá
-   đơn gia hạn thật, gồm cả proration tồn đọng và phase đã schedule.
-7. **Dunning** — gắn thẻ `declined`, tua tới kỳ gia hạn: hoá đơn `past_due`,
-   policy `dunning.pastDueBehavior` quyết định huỷ / pause / để Stripe retry.
-8. **Refund** — tab *Invoices & refunds*, bấm Refund trên hoá đơn đã trả. Thử
-   hạ `maxAutoApproveCents` hoặc `windowDays` để thấy API chặn đúng luật.
-9. **Pause theo mùa** — *Pause (seasonal)*: `pause_collection` với behavior lấy
-   từ policy, tương ứng luồng OnHold của OptiSigns.
-10. **X Social theo MODEL V6** — tạo account có test clock, mua Standard, tua
-    tới giữa tháng rồi bật **X Social: On**: preview hiện hoá đơn Stripe prorate
-    và quota `floor(2.000 × ngày đã trả / ngày của quota month)`. Khối **X
-    add-on** ở cột trái hiện status, quota month, Granted/Used/Remaining,
-    paidThrough và capacity.
-10b. **Provider fetch** — trong khối X add-on chọn Initial/Auto/Manual, nhập
-    *asked* và *returned*: quota trừ theo *returned*, clamp theo Remaining.
-10c. **Cancel → Mua lại X** — *Cancel X*: tenant FROZEN tới hết quota month; chỉ
-    credit phần `quotaMonthEnd → xPaidThrough` nếu nó tồn tại (billing neo ngày 20
-    thì có, neo ngày 1 thì không). *Buy X again* (hoặc bật X lại) trước ngày 1
-    khôi phục FrozenRemaining; tua qua ngày 1 rồi mua lại thì là kích hoạt mới.
-    Kịch bản đầy đủ: `node scripts/verify-x-v6.mjs`.
+1. **Adding screens charges immediately** — create an account with a test clock, attach a test card,
+   buy Engage with 2 screens. Advance +10 days, increase to 3 screens: Stripe issues a
+   `subscription_update` invoice for **$20.00** ($30 × 20/30 remaining days) and collects it right away; the
+   renewal date stays the same — matching OptiSigns' production behaviour. Change
+   `screensIncrease.prorationBehavior` to `create_prorations` to see the behaviour of
+   rolling into the next period's invoice (this is what the public support article describes, but it is
+   outdated — see [docs/optisigns-billing-model.md](docs/optisigns-billing-model.md)).
+2. **Credit when removing screens** — reduce to 2 screens: the account credit increases
+   (shown in the sidebar), and the next period's invoice deducts it automatically.
+3a. **Upgrading the plan charges immediately** — Standard → Pro Plus mid-period: one
+   `subscription_update` invoice containing the unused old portion (negative) + the remaining new portion (positive),
+   collecting exactly the difference. The renewal date stays the same.
+3b. **Buying an add-on charges immediately** — add AeriCast mid-period: Stripe issues a separate invoice
+   for the prorated portion and collects it right away; the renewal date does not change. Switch to the
+   `charge_fails` card and buy again to see `error_if_incomplete` block it outright.
+3. **Real refund on downgrade** — switch the preset to `customer_friendly`, repeat
+   the reduction: the app detects the credit just created, refunds it to the card and records a reversing
+   entry so it is not applied twice.
+4. **Switch monthly → yearly** — `billing_cycle_anchor: now`, the cycle resets, Stripe
+   collects the full 12 months immediately and deducts the unused part of the month.
+4b. **Switch yearly → monthly** — applied immediately by default: Stripe issues an invoice containing the unused part of the year
+   (negative) + the first monthly month (positive); the **net** remainder becomes account
+   credit (`−$240.74`), and the money never leaves Stripe. The `annual_commitment` preset gives the
+   wait-until-year-end behaviour; `customer_friendly` gives the refund-straight-to-card behaviour.
+5. **Downgrade waits until period end** — `annual_commitment` preset, downgrade the plan: the app creates a
+   subscription schedule, the current plan stays until the end of the period, and the Subscription tab
+   shows "Scheduled change".
+6. **Advancing time** — the *Next renewal* button in the Time machine: Stripe issues a real renewal
+   invoice, including any pending proration and scheduled phases.
+7. **Dunning** — attach the `declined` card, advance to the renewal: the invoice goes `past_due`,
+   and the `dunning.pastDueBehavior` policy decides whether to Cancel / pause / let Stripe retry.
+8. **Refund** — the *Invoices & refunds* tab, click Refund on a paid invoice. Try
+   lowering `maxAutoApproveCents` or `windowDays` to see the API block it according to the rules.
+9. **Seasonal pause** — *Pause (seasonal)*: `pause_collection` with the behavior taken
+   from the policy, corresponding to OptiSigns' OnHold flow.
+10. **X Social per MODEL V6** — create an account with a test clock, buy Standard, advance
+    to mid-month, then turn on **X Social: On**: the preview shows the prorated Stripe invoice
+    and the quota `floor(2,000 × paid days / days in the quota month)`. The **X
+    add-on** block in the left column shows status, quota month, Granted/Used/Remaining,
+    paidThrough and capacity.
+10b. **Provider fetch** — in the X add-on block pick Initial/Auto/Manual, enter
+    *asked* and *returned*: quota is deducted by *returned*, clamped by Remaining.
+10c. **Cancel → Buy X again** — *Cancel X*: the tenant is FROZEN until the end of the quota month, and the X
+    item on Stripe is **kept, with quantity set to 0** until `AlreadyPaidUntil`; only the
+    `quotaMonthEnd → xPaidThrough` portion is credited, if it exists (a Monthly X with aligned
+    cycles never has it; a Yearly X bought 05/09 and cancelled 20/09 is credited **$198.25** for
+    05/10/2026 → 05/09/2027). *Buy X again* (or turning X back on) before that point takes
+    that same item from 0 to 1 and restores FrozenRemaining; advancing past that point means the item
+    is cleaned up and buying again is a new activation.
+    Full scenario: `node scripts/verify-x-v6.mjs`.
 
-Tab **Activity log** ghi lại mọi thao tác: rule nào được áp, policy lúc đó ra
-sao, payload gửi sang Stripe là gì và Stripe trả về gì.
+The **Activity log** tab records every action: which rule was applied, what the policy looked like
+at that moment, what payload was sent to Stripe and what Stripe returned.
 
 ---
 
 ## 5. API
 
-| Method | Endpoint | Việc |
+| Method | Endpoint | Purpose |
 |---|---|---|
-| `GET` | `/api/catalog` | bảng giá + trạng thái sync |
-| `POST` | `/api/catalog/sync-stripe` | tạo/cập nhật product & price trên Stripe |
-| `POST` | `/api/catalog/reseed` | ghi lại bảng giá từ code vào Mongo |
-| `GET/POST` | `/api/accounts` | danh sách / tạo account (kèm test clock) |
-| `POST` | `/api/accounts/:id/payment-method/test` | gắn thẻ test (`visa`, `declined`, `authentication_required`, …) |
-| `POST` | `/api/accounts/:id/checkout-setup` | Checkout session mode=setup để nhập thẻ thật |
-| `GET/POST` | `/api/accounts/:id/balance` | xem / điều chỉnh customer balance |
-| `GET` | `/api/subscriptions/:id` | trạng thái subscription + schedule |
-| `POST` | `/api/subscriptions/:id/preview` | **dry-run**: hoá đơn Stripe sẽ tạo + giải thích rule |
-| `POST` | `/api/subscriptions/:id/change` | áp thay đổi theo policy |
-| `POST` | `/api/subscriptions/:id/cancel` \| `/resume` \| `/pause` \| `/unpause` \| `/end-trial` | vòng đời |
-| `POST` | `/api/subscriptions/:id/cancel-scheduled-change` | huỷ một thay đổi đang chờ cuối kỳ, trước khi nó có hiệu lực |
-| `GET` | `/api/subscriptions/:id/renewal-preview` | hoá đơn gia hạn kế tiếp |
-| `GET` | `/api/billing/accounts/:id/invoices` | hoá đơn kèm line item, đánh dấu proration |
-| `POST` | `/api/billing/invoices/:id/pay` \| `/void` \| `/finalize` \| `/uncollectible` | thao tác hoá đơn |
-| `POST` | `/api/billing/accounts/:id/refund` | refund / credit note theo policy |
-| `POST` | `/api/billing/portal/configuration` | đẩy policy sang Customer Portal config |
-| `GET/PUT` | `/api/policy` | đọc / sửa billing policy |
-| `POST` | `/api/policy/presets/:key` | áp preset |
-| `POST` | `/api/simulator/:id/advance` | tua test clock |
-| `GET` | `/api/x-addon/:id` | X add-on: status, quota month, ledger, paidThrough, coverage, capacity (reconcile từ hoá đơn đã paid) |
-| `POST` | `/api/x-addon/:id/preview/:action` | dry-run `purchase` \| `cancel` (mua lại sau Cancel cũng là `purchase`) |
-| `POST` | `/api/x-addon/:id/cancel` \| `/trial` | vòng đời X theo MODEL V6 — không có route resume; mua lại đi qua `/subscriptions/:id/change` |
-| `POST` | `/api/x-addon/:id/sync-runs` | một lần fetch provider `{kind, requested, returned, actionId}` — trừ quota exactly-once |
-| `POST` | `/api/webhooks/stripe` | webhook (raw body, có verify chữ ký) |
-| `GET` | `/api/events` | nhật ký audit |
+| `GET` | `/api/catalog` | price list + sync status |
+| `POST` | `/api/catalog/sync-stripe` | create/update products & prices on Stripe |
+| `POST` | `/api/catalog/reseed` | rewrite the price list from code into Mongo |
+| `GET/POST` | `/api/accounts` | list / create accounts (with test clock) |
+| `POST` | `/api/accounts/:id/payment-method/test` | attach a test card (`visa`, `declined`, `authentication_required`, …) |
+| `POST` | `/api/accounts/:id/checkout-setup` | Checkout session mode=setup to enter a real card |
+| `GET/POST` | `/api/accounts/:id/balance` | view / adjust the customer balance |
+| `GET` | `/api/subscriptions/:id` | subscription + schedule state |
+| `POST` | `/api/subscriptions/:id/preview` | **dry-run**: the invoice Stripe would create + rule explanation |
+| `POST` | `/api/subscriptions/:id/change` | apply a change according to the policy |
+| `POST` | `/api/subscriptions/:id/cancel` \| `/resume` \| `/pause` \| `/unpause` \| `/end-trial` | lifecycle |
+| `POST` | `/api/subscriptions/:id/cancel-scheduled-change` | Cancel a change pending at period end, before it takes effect |
+| `GET` | `/api/subscriptions/:id/renewal-preview` | next renewal invoice |
+| `GET` | `/api/billing/accounts/:id/invoices` | invoices with line items, proration flagged |
+| `POST` | `/api/billing/invoices/:id/pay` \| `/void` \| `/finalize` \| `/uncollectible` | invoice actions |
+| `POST` | `/api/billing/accounts/:id/refund` | refund / credit note according to the policy |
+| `POST` | `/api/billing/portal/configuration` | push the policy to the Customer Portal config |
+| `GET/PUT` | `/api/policy` | read / edit the billing policy |
+| `POST` | `/api/policy/presets/:key` | apply a preset |
+| `POST` | `/api/simulator/:id/advance` | advance the test clock |
+| `GET` | `/api/x-addon/:id` | X add-on: status, quota month, ledger, paidThrough, coverage, capacity (reconciled from paid invoices) |
+| `POST` | `/api/x-addon/:id/preview/:action` | dry-run `purchase` \| `cancel` (buying again after Cancel is also `purchase`) |
+| `POST` | `/api/x-addon/:id/cancel` \| `/trial` | X lifecycle per MODEL V6 — Cancel takes the item to quantity 0; there is no resume route; buying again goes through `/subscriptions/:id/change` |
+| `POST` | `/api/x-addon/:id/sync-runs` | one provider fetch `{kind, requested, returned, actionId}` — deducts quota exactly-once |
+| `POST` | `/api/webhooks/stripe` | webhook (raw body, with signature verification) |
+| `GET` | `/api/events` | audit log |
 
 ---
 
-## 6. Kiến trúc
+## 6. Architecture
 
 ```
 backend/src/
-  catalog/      bảng giá OptiSigns ↔ Stripe Product/Price (lookup_key, idempotent)
-  policy/       billing policy + preset  ← toàn bộ "cơ chế" nằm ở đây
-  accounts/     tenant demo, Stripe customer, thẻ test, test clock, balance
-  subscriptions/phân loại thay đổi → dựng item → update / schedule / cancel
-  billing/      hoá đơn, refund, credit note, customer portal
+  catalog/      OptiSigns price list ↔ Stripe Product/Price (lookup_key, idempotent)
+  policy/       billing policy + presets  ← all the "mechanics" live here
+  accounts/     demo tenants, Stripe customer, test cards, test clock, balance
+  subscriptions/classify change → build items → update / schedule / cancel
+  billing/      invoices, refunds, credit notes, customer portal
   simulator/    test clock
-  x-addon/      X Social MODEL V6: quota ledger theo quota month, capacity, cancel/mua lại/trial
-  webhooks/     nhận sự kiện, sync ngược về Mongo, thực thi dunning
-  events/       audit log (policy + payload + kết quả)
+  x-addon/      X Social MODEL V6: quota ledger per anchored quota month, capacity, cancel/buy again/trial
+  webhooks/     receive events, sync back to Mongo, execute dunning
+  events/       audit log (policy + payload + result)
 ```
 
-Luồng của một thay đổi:
+Flow of a change:
 
 ```
-desired state → validate ràng buộc → classifyChange() → rule = policy + override
+desired state → validate constraints → classifyChange() → rule = policy + override
    → timing=immediate ? subscriptions.update : subscriptionSchedules.update
-   → đo customer.balance trước/sau → áp creditHandling
-   → ghi audit → sync về Mongo
+   → measure customer.balance before/after → apply creditHandling
+   → write audit → sync to Mongo
 ```
 
-## 7. Giới hạn đã biết
+## 7. Known limitations
 
-- **Không có auth.** Mọi endpoint đều mở — demo chạy local, đừng expose ra ngoài.
-- **X add-on chỉ mô phỏng phần billing/quota của MODEL V6.** Không gọi X API:
-  provider fetch là ô nhập tay (`/x-addon/:id/sync-runs`), fan-out là một cờ
-  trạng thái. Global Batch Compliance, XAA `post.delete`, compliance lease 24 giờ
-  và Profile cap 10 không nằm trong demo này.
-- **Không có webhook secret** trong cấu hình mặc định, nên các hành động dunning
-  tự động không tự kích hoạt.
-- `billing_mode` chỉ đặt được lúc tạo subscription (giới hạn của Stripe). Đổi
-  trong policy chỉ ảnh hưởng subscription tạo sau đó; app sẽ cảnh báo khi
-  subscription đang chạy lệch với policy.
-- `automatic_tax` và `anchorToFirstOfMonth` cũng chỉ áp lúc tạo.
-- `payment_behavior = default_incomplete` cần confirm PaymentIntent phía client;
-  app không nhúng Stripe Elements nên sẽ hiện cảnh báo kèm link hosted invoice
-  để hoàn tất.
-- Đổi `CURRENCY` sau khi đã sync sẽ tạo bộ Price mới (price cũ được archive).
-- Subscription chứa Price đã bị gỡ khỏi catalog sẽ được cảnh báo rõ ràng thay vì
-  đọc sai âm thầm.
+- **No auth.** Every endpoint is open — the demo runs locally; do not expose it.
+- **The X add-on only simulates the billing/quota part of MODEL V6.** It does not call the X API:
+  provider fetch is a manual input (`/x-addon/:id/sync-runs`), and fan-out is a status
+  flag. Global Batch Compliance, XAA `post.delete`, the 24-hour compliance lease
+  and the Profile cap of 10 are not part of this demo.
+- **No webhook secret** in the default configuration, so automatic dunning actions
+  do not trigger on their own.
+- `billing_mode` can only be set when creating a subscription (a Stripe limitation). Changing it
+  in the policy only affects subscriptions created afterwards; the app warns when a
+  running subscription diverges from the policy.
+- `automatic_tax` and `anchorToFirstOfMonth` also only apply at creation.
+- `payment_behavior = default_incomplete` requires confirming the PaymentIntent on the client;
+  the app does not embed Stripe Elements, so it shows a warning with a hosted invoice link
+  to complete it.
+- Changing `CURRENCY` after syncing creates a new set of Prices (the old prices are archived).
+- A subscription containing a Price that has been removed from the catalog is flagged with a clear warning instead of
+  being silently misread.
 
-## 8. Lưu ý
+## 8. Notes
 
-- Chỉ dùng **khoá test mode** (`sk_test_…`). App không bao giờ chạm vào dữ liệu
-  thẻ thật: thẻ demo dùng payment method token dùng chung của Stripe.
-- Test clock chỉ gắn được **lúc tạo customer**, nên hãy bật tuỳ chọn đó khi tạo
-  account nếu muốn tua thời gian.
-- `billing_mode` chỉ đặt được khi tạo subscription; đổi trong policy chỉ ảnh
-  hưởng subscription tạo sau đó.
+- Use **test mode keys** only (`sk_test_…`). The app never touches real card
+  data: demo cards use Stripe's shared payment method tokens.
+- A test clock can only be attached **when creating the customer**, so enable that option when creating
+  the account if you want to advance time.
+- `billing_mode` can only be set when creating a subscription; changing it in the policy only
+  affects subscriptions created afterwards.

@@ -6,6 +6,8 @@ import {
   XCapacityReservationSchema,
   XQuotaLedger,
   XQuotaLedgerSchema,
+  XTenantLock,
+  XTenantLockSchema,
 } from './x-addon.schema';
 
 @Module({
@@ -13,6 +15,7 @@ import {
     MongooseModule.forFeature([
       { name: XQuotaLedger.name, schema: XQuotaLedgerSchema },
       { name: XCapacityReservation.name, schema: XCapacityReservationSchema },
+      { name: XTenantLock.name, schema: XTenantLockSchema },
     ]),
   ],
   providers: [XAddonService],

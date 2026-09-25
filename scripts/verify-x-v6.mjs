@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 /**
  * The X add-on against MODEL V6, end to end on real Stripe test-mode objects.
- * Every scenario runs on its own tenant bound to a Stripe test clock set to the
- * dates the model's own worked examples use, so the expected numbers are the
- * model's numbers (1,066 / 1,733 / 580 + 1,420 …), not ones derived here.
+ * Every scenario runs on its own tenant bound to a Stripe test clock, so each
+ * base plan's billing_cycle_anchor is the tenant's clock start.
+ *
+ * The quota cycle is stepped from the base plan's billing cycle anchor as it
+ * was when X was bought, so a quota month is the billing month — 20/09 → 20/10
+ * on a plan billed on the 20th, not a calendar month. Only a base-plan interval
+ * change makes the two run apart: Stripe restarts billing, the quota cycle keeps
+ * its anchor (scenarios E and Q).
  *
  *   node scripts/verify-x-v6.mjs [--keep] [--only=A,D]
  *
@@ -101,6 +106,16 @@ const sync = (id, body) => POST(`/x-addon/${id}/sync-runs`, body);
 const invoices = (id) => GET(`/billing/accounts/${id}/invoices`);
 const balance = async (id) => (await GET(`/accounts/${id}/balance`)).balance;
 const hasXItem = (s) => (s.current.addOns ?? []).some((a) => a.code === 'x_social');
+// rows 49, 51: after a Cancel the same X item stays on Stripe at quantity 0 until AlreadyPaidUntil
+let X_PRODUCT = null;
+let X_PRICES = {};
+const xOnStripe = async (id) => {
+  const s = await state(id);
+  const sub = await stripe.subscriptions.retrieve(s.stripe.id);
+  return sub.items.data.filter((i) => (typeof i.price.product === 'string' ? i.price.product : i.price.product?.id) === X_PRODUCT);
+};
+const xAmount = (inv) => (inv?.lines ?? []).filter((l) => /X Social/.test(l.description ?? '')).reduce((s, l) => s + l.amount, 0);
+const hasXLine = (inv) => (inv?.lines ?? []).some((l) => /X Social/.test(l.description ?? ''));
 
 async function scenario(key, title, fn) {
   if (ONLY.length && !ONLY.includes(key)) return;
@@ -123,6 +138,8 @@ const run = async () => {
   check('$20 a month, $216 a year (row 4)', x?.monthlyCents === 2000 && x?.annualMonthlyCents * 12 === 21600,
     `${money(x?.monthlyCents)} / ${money(x?.annualMonthlyCents * 12)}`);
   check('No Standard/Pro tiers left (row 48)', !(await GET('/catalog')).addons.some((a) => /x_social_(standard|pro)/.test(a.code)));
+  X_PRODUCT = x?.stripeProductId;
+  X_PRICES = { monthly: x?.monthlyPrice?.priceId, yearly: x?.yearlyPrice?.priceId };
   await POST('/policy/presets/scio_portal_mvp');
 
   await scenario('A', 'First purchase mid quota month, deduction by billed Posts, reset at the quota boundary', async () => {
@@ -173,27 +190,30 @@ const run = async () => {
     t.done = true;
   });
 
-  await scenario('B', 'Billing anchor ≠ quota month: delta on renewal, payment failure, paid retry', async () => {
+  await scenario('B', 'Billing anchored on the 10th: the quota month IS the billing month; renewal, payment failure, paid retry', async () => {
     const t = await tenant('b', at(2026, 9, 10));
-    const bought = await buyX(t);
-    check('Bought on 10/09: floor(2,000 × 21/30) = 1,400', bought.state.xAddon.ledger?.granted === 1400, `${bought.state.xAddon.ledger?.granted}`);
+    const bought = (await buyX(t)).state.xAddon;
+    check('Bought on 10/09 at the start of the billing month: the whole 2,000', bought.ledger?.granted === 2000, `${bought.ledger?.granted}`);
+    check('The quota month follows the base plan: 10/09 → 10/10, not 01/09 → 01/10',
+      bought.quotaMonth.start === at(2026, 9, 10) && bought.quotaMonth.end === at(2026, 10, 10) && bought.quotaAnchor === at(2026, 9, 10),
+      `${day(bought.quotaMonth.start)} → ${day(bought.quotaMonth.end)}`);
 
     const early = (await advance(t.id, at(2026, 10, 2))).state.xAddon;
-    check('October before the renewal: floor(2,000 × 9/31) = 580 (row 46)', early.ledger?.granted === 580, `${early.ledger?.granted}`);
-    check('UI says the month is granted by paid time, not lost (row 56)',
-      early.warnings.some((w) => /Paid through 2026-10-10/.test(w) && /not lost/.test(w)), early.warnings[0]);
+    check('On 02/10 it is still the same quota month and still 2,000 — no calendar split at 01/10', early.ledger?.granted === 2000 && early.quotaMonth.start === at(2026, 9, 10),
+      `${early.ledger?.granted} · ${day(early.quotaMonth.start)}`);
+    check('Nothing is paid short of the quota month, so no "paid through" warning', !early.warnings.some((w) => /Paid through/.test(w)), early.warnings[0] ?? 'none');
     await sync(t.id, { kind: 'auto', returned: 100, actionId: 'b-1' });
 
     const renewed = (await advance(t.id, at(2026, 10, 10, 1))).state.xAddon;
-    check('Renewal paid on 10/10 adds the missing +1,420 to the same ledger (row 66)', renewed.ledger?.granted === 2000,
-      `${renewed.ledger?.granted} · grants ${renewed.ledger?.grants.map((g) => `+${g.delta}`).join(' ')}`);
-    check('Used is untouched by the renewal', renewed.ledger?.used === 100, `used ${renewed.ledger?.used}`);
+    check('Renewal paid on 10/10 opens the next quota month at 2,000', renewed.ledger?.granted === 2000 && renewed.quotaMonth.start === at(2026, 10, 10),
+      `${renewed.ledger?.granted} · ${day(renewed.quotaMonth.start)}`);
+    check('Used starts at 0 — the previous month\'s leftover does not roll over', renewed.ledger?.used === 0, `used ${renewed.ledger?.used}`);
 
     await POST(`/accounts/${t.id}/payment-method/test`, { kind: 'charge_fails' });
     const failed = (await advance(t.id, at(2026, 11, 10, 1))).state;
     const xs = failed.xAddon;
     check('Renewal 10/11 fails: Stripe keeps it open', failed.stripe.status === 'past_due', failed.stripe.status);
-    check('November grants only the paid 01/11 → 10/11: 600 (row 53)', xs.ledger?.granted === 600, `${xs.ledger?.granted}`);
+    check('The quota month 10/11 → 10/12 has no paid time, so nothing is granted (row 53)', (xs.ledger?.granted ?? 0) === 0, `${xs.ledger?.granted ?? 0}`);
     check('Past paidThrough nothing is fetched (PAYMENT_PENDING)', xs.status === 'PAYMENT_PENDING' && !xs.canFetchNewPosts, xs.status);
     const blocked = await refused(() => sync(t.id, { kind: 'auto', returned: 5 }), /PAYMENT_PENDING/);
     check('A sync run is refused, nothing charged', blocked.refused && blocked.status === 409);
@@ -202,14 +222,14 @@ const run = async () => {
     const open = (await invoices(t.id)).find((i) => i.status === 'open');
     await POST(`/billing/invoices/${open.id}/pay`);
     const paid = (await state(t.id)).xAddon;
-    check('Paid on retry: ACTIVE, +1,400 delta, Used kept (EASY 4)', paid.status === 'ACTIVE' && paid.ledger?.granted === 2000 && paid.ledger?.used === 0,
+    check('Paid on retry: ACTIVE, the month granted 2,000, Used 0 (EASY 4)', paid.status === 'ACTIVE' && paid.ledger?.granted === 2000 && paid.ledger?.used === 0,
       `${paid.status} · ${paid.ledger?.granted} / used ${paid.ledger?.used}`);
     t.done = true;
   });
 
   await scenario('C', 'Monthly cancel with no future coverage, then Buy X again inside and after the quota month', async () => {
     const t = await tenant('c', at(2026, 9, 1));
-    await buyX(t);
+    const itemId = (await buyX(t)).state.xAddon.itemId;
     await sync(t.id, { kind: 'initial', returned: 300, actionId: 'c-1' });
     await advance(t.id, at(2026, 9, 10));
 
@@ -219,7 +239,12 @@ const run = async () => {
     check('Cancel preview: quotaMonthEnd 01/10 is not before xPaidThrough 01/10 → no-proration, no credit (row 49)', pv.stripeParams.proration_behavior === 'none' && !pv.invoice);
     const cancelled = (await POST(`/x-addon/${t.id}/cancel`)).state;
     const xs = cancelled.xAddon;
-    check('Cancel takes effect now: X item gone, base untouched', !hasXItem(cancelled) && cancelled.stripe.status === 'active');
+    check('Cancel takes effect now: X no longer active, base untouched', !hasXItem(cancelled) && cancelled.stripe.status === 'active');
+    const parked = await xOnStripe(t.id);
+    check('…and the same X item stays on Stripe at quantity 0, not deleted (row 49)', parked.length === 1 && parked[0].id === itemId && parked[0].quantity === 0,
+      parked.map((i) => `${i.id} ×${i.quantity}`).join(' '));
+    check('Kept until AlreadyPaidUntil = min(oldPaidThrough 01/10, quotaMonthEnd 01/10) = 01/10', xs.parkedItem?.alreadyPaidUntil === at(2026, 10, 1),
+      day(xs.parkedItem?.alreadyPaidUntil));
     check('FROZEN until quotaMonthEnd 01/10, fan-out off', xs.status === 'FROZEN' && xs.frozen?.until === at(2026, 10, 1) && !xs.fanOut && !xs.canFetchNewPosts,
       `${xs.status} until ${day(xs.frozen?.until)}`);
     check('No future paid coverage, so no credit (row 7)', (await balance(t.id)) === before && (await invoices(t.id)).length === invCount, money(before));
@@ -237,59 +262,83 @@ const run = async () => {
     check('Bought again inside the quota month: FrozenRemaining restored, 2,000 / 300 (row 59)', rebought.status === 'ACTIVE' && rebought.ledger?.granted === 2000 && rebought.ledger?.used === 300,
       `${rebought.status} · ${rebought.ledger?.granted} / ${rebought.ledger?.used}`);
     check('No invoice for buying it again', (await invoices(t.id)).length === invCount);
+    const back = await xOnStripe(t.id);
+    check('The same item went back from quantity 0 to 1 (row 59)', back.length === 1 && back[0].id === itemId && back[0].quantity === 1,
+      back.map((i) => `${i.id} ×${i.quantity}`).join(' '));
     check('Capacity reserved again', rebought.capacity.mine?.status === 'committed');
 
     await advance(t.id, at(2026, 9, 20));
     await POST(`/x-addon/${t.id}/cancel`);
+    // hold the cleanup back so buying X again and the cleanup meet at the boundary
+    await PUT('/policy', { constraints: { xCleanupPaused: true } });
     const later = (await advance(t.id, at(2026, 10, 5))).state.xAddon;
     check('After quotaMonthEnd it is CANCELED — the old quota expired', later.status === 'CANCELED' && later.repurchase?.kind === 'new_activation',
       `${later.status} · ${later.repurchase?.kind}`);
-    const react = (await buyX(t)).state;
+    const renewal = (await invoices(t.id)).find((i) => i.billingReason === 'subscription_cycle');
+    check('The 01/10 renewal charges nothing for the quantity-0 item', xAmount(renewal) === 0,
+      `${renewal?.number ?? '—'} X ${money(xAmount(renewal))}${hasXLine(renewal) ? ' (a $0 X line is on it: the renewal ran before the cleanup could)' : ''}`);
+    await POST('/policy/presets/scio_portal_mvp');
+    const invBefore = (await invoices(t.id)).length;
+    const [raced] = await Promise.all([buyX(t), state(t.id), state(t.id), state(t.id)]);
+    const react = raced.state;
+    const after = await xOnStripe(t.id);
+    check('Buying X again racing three reads of the cleanup: exactly one X item, at quantity 1 (row 8)',
+      after.length === 1 && after[0].quantity === 1 && react.xAddon.status === 'ACTIVE',
+      after.map((i) => `${i.id === itemId ? 'same' : 'new'} ${i.id} ×${i.quantity}`).join(' '));
     const inv = (await invoices(t.id))[0];
-    check('New activation charges from 05/10 to the 01/11 boundary', inv.status === 'paid' && near(inv.total, Math.round((2000 * 27) / 31)),
+    check('…charged once, from 05/10 to the 01/11 boundary', (await invoices(t.id)).length === invBefore + 1 && inv.status === 'paid' && near(inv.total, Math.round((2000 * 27) / 31)),
       `${inv.number} ${money(inv.total)}`);
     check('October granted by paid coverage: floor(2,000 × 27/31) = 1,741, Used 0', react.xAddon.ledger?.granted === 1741 && react.xAddon.ledger?.used === 0,
       `${react.xAddon.ledger?.granted} / ${react.xAddon.ledger?.used}`);
     t.done = true;
   });
 
-  await scenario('D', 'Yearly: the model\'s own 05/09 example, cancel credit from quotaMonthEnd, Buy X again debits it back', async () => {
+  await scenario('D', 'Yearly from the start: quota months on the 5th, cancel credit from quotaMonthEnd, Buy X again debits it back', async () => {
     const t = await tenant('d', at(2026, 9, 5), { term: 'yearly' });
     const bought = await buyX(t);
-    check('Annual bought 05/09: first quota month 05/09 → 01/10 = 1,733 (row 63)', bought.state.xAddon.ledger?.granted === 1733,
-      `${bought.state.xAddon.ledger?.granted}`);
+    const itemId = bought.state.xAddon.itemId;
+    check('Annual bought 05/09: the quota month is 05/09 → 05/10, a whole 2,000', bought.state.xAddon.ledger?.granted === 2000 &&
+      bought.state.xAddon.quotaMonth.start === at(2026, 9, 5) && bought.state.xAddon.quotaMonth.end === at(2026, 10, 5),
+      `${bought.state.xAddon.ledger?.granted} · ${day(bought.state.xAddon.quotaMonth.start)} → ${day(bought.state.xAddon.quotaMonth.end)}`);
     const buyInv = (await invoices(t.id))[0];
     check('$216 charged for the year', buyInv.status === 'paid' && near(buyInv.total, 21600), money(buyInv.total));
 
     await advance(t.id, at(2026, 9, 20));
     const before = await balance(t.id);
     const pv = await POST(`/x-addon/${t.id}/preview/cancel`);
-    check('Cancel preview: proration_date = quotaMonthEnd 01/10', pv.stripeParams.proration_date === at(2026, 10, 1), day(pv.stripeParams.proration_date));
+    check('Cancel preview: proration_date = quotaMonthEnd 05/10', pv.stripeParams.proration_date === at(2026, 10, 5), day(pv.stripeParams.proration_date));
     const cancelled = (await POST(`/x-addon/${t.id}/cancel`)).state;
     const credit = before - (await balance(t.id));
-    const expected = Math.round((21600 * (at(2027, 9, 5) - at(2026, 10, 1))) / (at(2027, 9, 5) - at(2026, 9, 5)));
-    check('Stripe credits 01/10/2026 → 05/09/2027 to the customer balance (row 7)', near(credit, expected, 2), `${money(credit)} ≈ ${money(expected)}`);
-    check('September stays granted and FROZEN', cancelled.xAddon.status === 'FROZEN' && cancelled.xAddon.ledger?.granted === 1733);
+    const expected = Math.round((21600 * (at(2027, 9, 5) - at(2026, 10, 5))) / (at(2027, 9, 5) - at(2026, 9, 5)));
+    check('Stripe credits 05/10/2026 → 05/09/2027 to the customer balance (row 7)', near(credit, expected, 2), `${money(credit)} ≈ ${money(expected)}`);
+    check('The quota month in progress stays granted and FROZEN', cancelled.xAddon.status === 'FROZEN' && cancelled.xAddon.ledger?.granted === 2000);
+    const parked = await xOnStripe(t.id);
+    check('Yearly too: the same item at quantity 0 until quotaMonthEnd 05/10', parked.length === 1 && parked[0].id === itemId && parked[0].quantity === 0 &&
+      cancelled.xAddon.parkedItem?.alreadyPaidUntil === at(2026, 10, 5), day(cancelled.xAddon.parkedItem?.alreadyPaidUntil));
 
     await advance(t.id, at(2026, 9, 25));
     const rp = await previewBuyX(t);
-    check('Buying X again re-debits from the same boundary', rp.stripeParams.proration_date === at(2026, 10, 1) && rp.stripeParams.proration_behavior === 'always_invoice',
+    check('Buying X again re-debits from the same boundary, on the same item 0 → 1', rp.stripeParams.proration_date === at(2026, 10, 5) && rp.stripeParams.proration_behavior === 'always_invoice' && rp.stripeParams.items[0].id === itemId,
       `${day(rp.stripeParams.proration_date)} · ${rp.stripeParams.proration_behavior}`);
     const rebought = (await buyX(t)).state.xAddon;
     const inv = (await invoices(t.id))[0];
     check('The buy-again invoice equals the credit, paid from the balance', near(inv.total, credit, 2) && inv.amountDue === 0 && inv.status === 'paid',
       `${inv.number} ${money(inv.total)} due ${money(inv.amountDue)}`);
     check('Balance back where it was, no card charge', near(await balance(t.id), before, 2), money(await balance(t.id)));
-    check('Same ledger: 1,733 granted, not granted again', rebought.status === 'ACTIVE' && rebought.ledger?.granted === 1733,
+    check('Same ledger: 2,000 granted, not granted again', rebought.status === 'ACTIVE' && rebought.ledger?.granted === 2000,
       `${rebought.status} · ${rebought.ledger?.granted}`);
     check('Coverage is one continuous year again', rebought.coverage.length === 1 && rebought.coverage[0].end === at(2027, 9, 5),
       JSON.stringify(rebought.coverage.map((i) => `${day(i.start)}→${day(i.end)}`)));
     t.done = true;
   });
 
-  await scenario('E', 'Interval change: native proration with X active, X left out while frozen', async () => {
+  await scenario('E', 'Interval change: billing restarts, the quota cycle keeps its anchor; X left out while frozen', async () => {
     const t = await tenant('e', at(2026, 9, 15));
-    await buyX(t);
+    const first = (await buyX(t)).state.xAddon;
+    const itemId = first.itemId;
+    check('Bought on 15/09 on a base plan billed on the 15th: quota month 15/09 → 15/10, 2,000',
+      first.ledger?.granted === 2000 && first.quotaMonth.start === at(2026, 9, 15) && first.quotaAnchor === at(2026, 9, 15),
+      `${first.ledger?.granted} · ${day(first.quotaMonth.start)} → ${day(first.quotaMonth.end)}`);
     await sync(t.id, { kind: 'auto', returned: 100, actionId: 'e-1' });
     await advance(t.id, at(2026, 9, 20));
 
@@ -300,7 +349,12 @@ const run = async () => {
       yearly.state.current.term === 'yearly' && xLines.some((l) => l.amount < 0) && xLines.some((l) => l.amount > 0),
       xLines.map((l) => money(l.amount)).join(' '));
     const xs = yearly.state.xAddon;
-    check('15/09 → 01/10 still 1,066 — the switch grants no second time (CASE 9)', xs.ledger?.granted === 1066, `${xs.ledger?.granted}`);
+    const liveSub = await stripe.subscriptions.retrieve(yearly.state.stripe.id);
+    check('Stripe restarted billing on 20/09 (billing_cycle_anchor = now)', liveSub.billing_cycle_anchor === at(2026, 9, 20), day(liveSub.billing_cycle_anchor));
+    check('…but the quota cycle keeps its anchor: still 15/09 → 15/10, not 20/09 → 20/10',
+      xs.quotaAnchor === at(2026, 9, 15) && xs.quotaMonth.start === at(2026, 9, 15) && xs.quotaMonth.end === at(2026, 10, 15),
+      `anchor ${day(xs.quotaAnchor)} · ${day(xs.quotaMonth.start)} → ${day(xs.quotaMonth.end)}`);
+    check('The switch grants no second time: still 2,000 (CASE 9)', xs.ledger?.granted === 2000, `${xs.ledger?.granted}`);
     check('Used 100 kept', xs.ledger?.used === 100);
     check('Paid coverage now runs to 20/09/2027', xs.coverage.at(-1)?.end === at(2027, 9, 20), day(xs.coverage.at(-1)?.end));
 
@@ -309,20 +363,47 @@ const run = async () => {
     await advance(t.id, at(2026, 9, 23));
     const monthly = await POST(`/subscriptions/${t.id}/change`, { ...t.base, term: 'monthly', addOns: [] });
     const inv2 = (await invoices(t.id))[0];
-    check('While frozen, only the base changes interval — no X line (row 64)',
-      monthly.state.current.term === 'monthly' && !inv2.lines.some((l) => /X Social/.test(l.description ?? '')) && monthly.state.xAddon.status === 'FROZEN',
-      `${monthly.state.xAddon.status}`);
+    const frozenItem = await xOnStripe(t.id);
+    check('While frozen, the base changes interval and X is neither charged nor credited (row 64)',
+      monthly.state.current.term === 'monthly' && xAmount(inv2) === 0 && monthly.state.xAddon.status === 'FROZEN',
+      `${monthly.state.xAddon.status} · X ${money(xAmount(inv2))}`);
+    check('The quantity-0 item follows the monthly price and stays at quantity 0 (CASE 9)',
+      frozenItem.length === 1 && frozenItem[0].id === itemId && frozenItem[0].quantity === 0 && frozenItem[0].price.id === X_PRICES.monthly,
+      frozenItem.map((i) => `${i.id} ×${i.quantity} ${i.price.recurring?.interval}`).join(' '));
     await advance(t.id, at(2026, 9, 24));
     const rp = await previewBuyX(t);
-    check('Buying X again charges from where the yearly credit started (01/10), on the new monthly price',
-      rp.stripeParams.proration_date === at(2026, 10, 1) && rp.stripeParams.items[0].price !== undefined,
+    check('Buying X again charges from where the yearly credit started (quotaMonthEnd 15/10), on the new monthly price',
+      rp.stripeParams.proration_date === at(2026, 10, 15) && rp.stripeParams.items[0].price !== undefined,
       `${day(rp.stripeParams.proration_date)}`);
     const rebought = (await buyX(t)).state.xAddon;
     const inv3 = (await invoices(t.id))[0];
-    const expected = Math.round((2000 * (at(2026, 10, 23) - at(2026, 10, 1))) / (at(2026, 10, 23) - at(2026, 9, 23)));
-    check('Charged 01/10 → 23/10 at $20/month', near(inv3.total, expected, 2), `${money(inv3.total)} ≈ ${money(expected)}`);
-    check('September ledger unchanged: 1,066 / 100', rebought.ledger?.granted === 1066 && rebought.ledger?.used === 100,
-      `${rebought.ledger?.granted} / ${rebought.ledger?.used}`);
+    const same = await xOnStripe(t.id);
+    check('Bought again on the same item, back to quantity 1', same.length === 1 && same[0].id === itemId && same[0].quantity === 1);
+    const expected = Math.round((2000 * (at(2026, 10, 23) - at(2026, 10, 15))) / (at(2026, 10, 23) - at(2026, 9, 23)));
+    check('Charged 15/10 → 23/10 at $20/month', near(inv3.total, expected, 2), `${money(inv3.total)} ≈ ${money(expected)}`);
+    check('The frozen quota month 15/09 → 15/10 is back unchanged: 2,000 / 100, on the original anchor',
+      rebought.ledger?.granted === 2000 && rebought.ledger?.used === 100 && rebought.quotaAnchor === at(2026, 9, 15),
+      `${rebought.ledger?.granted} / ${rebought.ledger?.used} · anchor ${day(rebought.quotaAnchor)}`);
+    t.done = true;
+  });
+
+  await scenario('Q', 'After an interval change the quota cycle and the billing cycle run apart', async () => {
+    const t = await tenant('q', at(2026, 9, 15));
+    await buyX(t);
+    await advance(t.id, at(2026, 9, 20));
+    await POST(`/subscriptions/${t.id}/change`, { ...t.base, term: 'yearly', addOns: X });
+    const oct = (await advance(t.id, at(2026, 10, 16))).state;
+    const sub = await stripe.subscriptions.retrieve(oct.stripe.id);
+    const period = sub.items.data[0];
+    check('Billing is one yearly period 20/09/2026 → 20/09/2027',
+      period.current_period_start === at(2026, 9, 20) && period.current_period_end === at(2027, 9, 20),
+      `${day(period.current_period_start)} → ${day(period.current_period_end)}`);
+    const xs = oct.xAddon;
+    check('…while the quota months stay monthly on the 15th: 15/10 → 15/11',
+      xs.quotaMonth.start === at(2026, 10, 15) && xs.quotaMonth.end === at(2026, 11, 15),
+      `${day(xs.quotaMonth.start)} → ${day(xs.quotaMonth.end)}`);
+    check('That month is paid by the year, so it is a fresh 2,000 with Used 0', xs.ledger?.granted === 2000 && xs.ledger?.used === 0,
+      `${xs.ledger?.granted} / ${xs.ledger?.used}`);
     t.done = true;
   });
 
@@ -398,7 +479,8 @@ const run = async () => {
     const toFree = await POST(`/subscriptions/${t.id}/change`, { planCode: 'free', term: 'monthly', screens: 1, addOns: [] });
     check('Downgrade to Free is scheduled for 10/10, not now (row 67)', toFree.state.stripe.cancelAtPeriodEnd === true && toFree.state.xAddon.status === 'ACTIVE');
     const oct = (await advance(t.id, at(2026, 10, 2))).state.xAddon;
-    check('October granted only up to the boundary: 580', oct.ledger?.granted === 580 && oct.status === 'ACTIVE', `${oct.ledger?.granted}`);
+    check('Before the boundary the quota month 10/09 → 10/10 is paid in full: 2,000', oct.ledger?.granted === 2000 && oct.status === 'ACTIVE' && oct.quotaMonth.end === at(2026, 10, 10),
+      `${oct.ledger?.granted} · until ${day(oct.quotaMonth.end)}`);
     const ended = (await advance(t.id, at(2026, 10, 10, 1))).state.xAddon;
     check('At the boundary X ends with the base (row 55)', ended.status === 'ENDED' && !ended.canFetchNewPosts && !ended.fanOut, ended.status);
     check('Capacity released', ended.capacity.mine === null);
@@ -425,67 +507,151 @@ const run = async () => {
     check('…with an alert and no extra quota', Boolean(fixed.quantityAlert) && fixed.ledger?.granted === 2000, fixed.quantityAlert);
     const events = await GET(`/events?accountId=${t.id}&limit=100`);
     check('The alert is in the audit log', events.some((e) => e.action === 'x.quantity_reconciled'));
+
+    await stripe.subscriptions.update(bought.stripe.id, { items: [{ id: item.id, quantity: 0 }], proration_behavior: 'none' });
+    const zero = (await state(t.id)).xAddon;
+    check('Quantity 0 with no Cancel recorded: not ACTIVE, alerted, nothing granted (EASY 5)',
+      zero.status !== 'ACTIVE' && /without a Cancel/.test(zero.quantityAlert ?? '') && !zero.canFetchNewPosts, `${zero.status} · ${zero.quantityAlert}`);
     t.done = true;
   });
 
-  await scenario('L', 'Monthly billing anchored on the 20th: Cancel credits the future coverage; Buy X again after quotaMonthEnd', async () => {
+  await scenario('L', 'Monthly billing anchored on the 20th: a Cancel has nothing to credit; Buy X again after quotaMonthEnd starts on the base cycle', async () => {
     const t = await tenant('l', at(2026, 9, 20));
     await buyX(t);
     await advance(t.id, at(2026, 9, 25));
     const before = await balance(t.id);
     const pv = await POST(`/x-addon/${t.id}/preview/cancel`);
-    check('quotaMonthEnd 01/10 < xPaidThrough 20/10 → proration_date = quotaMonthEnd, on a Monthly add-on (row 49)',
-      pv.stripeParams.proration_behavior === 'always_invoice' && pv.stripeParams.proration_date === at(2026, 10, 1),
-      `${pv.stripeParams.proration_behavior} · ${day(pv.stripeParams.proration_date)}`);
+    check('quotaMonthEnd 20/10 is xPaidThrough 20/10 — no future paid coverage → no-proration, no credit (row 49)',
+      pv.stripeParams.proration_behavior === 'none' && !pv.invoice, pv.stripeParams.proration_behavior);
     const cancelled = (await POST(`/x-addon/${t.id}/cancel`)).state;
-    const credit = before - (await balance(t.id));
-    const expected = Math.round((2000 * (at(2026, 10, 20) - at(2026, 10, 1))) / (at(2026, 10, 20) - at(2026, 9, 20)));
-    check('Stripe credits 01/10 → 20/10 to the customer balance, never the September stretch that funded the grant',
-      near(credit, expected, 2), `${money(credit)} ≈ ${money(expected)}`);
-    check('September stays granted and FROZEN', cancelled.xAddon.status === 'FROZEN' && cancelled.xAddon.ledger?.granted === Math.floor((2000 * 11) / 30),
-      `${cancelled.xAddon.status} · ${cancelled.xAddon.ledger?.granted}`);
+    check('Nothing credited', (await balance(t.id)) === before, money(await balance(t.id)));
+    check('The quota month 20/09 → 20/10 stays granted and FROZEN', cancelled.xAddon.status === 'FROZEN' && cancelled.xAddon.ledger?.granted === 2000 &&
+      cancelled.xAddon.frozen?.until === at(2026, 10, 20), `${cancelled.xAddon.status} · ${cancelled.xAddon.ledger?.granted} until ${day(cancelled.xAddon.frozen?.until)}`);
+    check('Kept until AlreadyPaidUntil = min(oldPaidThrough 20/10, quotaMonthEnd 20/10) = 20/10', cancelled.xAddon.parkedItem?.alreadyPaidUntil === at(2026, 10, 20),
+      day(cancelled.xAddon.parkedItem?.alreadyPaidUntil));
 
-    await advance(t.id, at(2026, 10, 5));
+    await advance(t.id, at(2026, 10, 25));
     const later = (await state(t.id)).xAddon;
     check('Past quotaMonthEnd the frozen quota has expired', later.status === 'CANCELED' && later.repurchase?.kind === 'new_activation', later.status);
-    const balBefore = await balance(t.id);
+    check('Past AlreadyPaidUntil 20/10 the quantity-0 item was cleaned up', (await xOnStripe(t.id)).length === 0 && Boolean(later.cleanedUpAt) && !later.parkedItem,
+      day(later.cleanedUpAt));
     const bought = (await buyX(t)).state.xAddon;
     const inv = (await invoices(t.id))[0];
-    const charge = Math.round((2000 * (at(2026, 10, 20) - at(2026, 10, 5))) / (at(2026, 10, 20) - at(2026, 9, 20)));
-    check('Bought again on 05/10: Stripe charges 05/10 → 20/10 (row 59, example 2)', near(inv.total, charge, 2), `${money(inv.total)} ≈ ${money(charge)}`);
-    check('01/10 → 05/10 stays a net credit on the balance', near((await balance(t.id)) - balBefore, charge, 2) && (await balance(t.id)) < 0,
-      money(await balance(t.id)));
-    check('October granted by the new paid coverage: floor(2,000 × 15/31) = 967', bought.ledger?.granted === 967, `${bought.ledger?.granted}`);
+    const charge = Math.round((2000 * (at(2026, 11, 20) - at(2026, 10, 25))) / (at(2026, 11, 20) - at(2026, 10, 20)));
+    check('Bought again on 25/10: Stripe charges 25/10 → 20/11 (row 59, example 2)', near(inv.total, charge, 2), `${money(inv.total)} ≈ ${money(charge)}`);
+    check('A new activation follows the base cycle: quota month 20/10 → 20/11', bought.quotaMonth.start === at(2026, 10, 20) && bought.quotaMonth.end === at(2026, 11, 20),
+      `${day(bought.quotaMonth.start)} → ${day(bought.quotaMonth.end)}`);
+    check('Granted by the new paid coverage: floor(2,000 × 26/31) = 1,677', bought.ledger?.granted === 1677, `${bought.ledger?.granted}`);
+    const fresh = await xOnStripe(t.id);
+    check('…on a new item, since the old one is gone', fresh.length === 1 && fresh[0].quantity === 1 && fresh[0].id !== cancelled.xAddon.parkedItem?.id);
     t.done = true;
   });
 
-  await scenario('M', 'Anchor on the 5th: a first purchase split across two quota months, then Buy X again before paidThrough', async () => {
+  await scenario('M', 'Anchor on the 5th: a first purchase inside one billing month, then Buy X again before paidThrough', async () => {
     const t = await tenant('m', at(2026, 8, 5));
     await advance(t.id, at(2026, 8, 30));
     const aug = (await buyX(t)).state.xAddon;
-    check('Bought 30/08 with the billing boundary 05/09: August gets floor(2,000 × 2/31) = 129 (row 47, example 2)', aug.ledger?.granted === 129, `${aug.ledger?.granted}`);
+    check('Bought 30/08 with the billing boundary 05/09: one quota month 05/08 → 05/09, floor(2,000 × 6/31) = 387',
+      aug.ledger?.granted === 387 && aug.quotaMonth.start === at(2026, 8, 5) && aug.quotaMonth.end === at(2026, 9, 5),
+      `${aug.ledger?.granted} · ${day(aug.quotaMonth.start)} → ${day(aug.quotaMonth.end)}`);
     const sep = (await advance(t.id, at(2026, 9, 2))).state.xAddon;
-    check('01/09 opens September at floor(2,000 × 4/30) = 266 — no automatic 2,000', sep.ledger?.granted === 266, `${sep.ledger?.granted}`);
+    check('01/09 is no boundary: still the same quota month at 387, not split into 129 + 266', sep.ledger?.granted === 387 && sep.quotaMonth.start === at(2026, 8, 5),
+      `${sep.ledger?.granted} · ${day(sep.quotaMonth.start)}`);
     await sync(t.id, { kind: 'auto', returned: 50, actionId: 'm-1' });
     const before = await balance(t.id);
     const pv = await POST(`/x-addon/${t.id}/preview/cancel`);
-    check('quotaMonthEnd 01/10 ≥ xPaidThrough 05/09 → no-proration, no credit', pv.stripeParams.proration_behavior === 'none');
-    await POST(`/x-addon/${t.id}/cancel`);
+    check('quotaMonthEnd 05/09 is xPaidThrough 05/09 → no-proration, no credit', pv.stripeParams.proration_behavior === 'none');
+    const cancelledM = (await POST(`/x-addon/${t.id}/cancel`)).state.xAddon;
     check('Nothing credited', (await balance(t.id)) === before);
+    check('AlreadyPaidUntil = min(oldPaidThrough 05/09, quotaMonthEnd 05/09) = 05/09', cancelledM.parkedItem?.alreadyPaidUntil === at(2026, 9, 5),
+      day(cancelledM.parkedItem?.alreadyPaidUntil));
     await advance(t.id, at(2026, 9, 4));
     const rp = await previewBuyX(t);
-    check('Buy X again on 04/09: AlreadyPaidUntil = min(05/09, 01/10) — nothing charged now (row 59, example 1)',
+    check('Buy X again on 04/09: already paid until 05/09 — nothing charged now (row 59, example 1)',
       rp.stripeParams.proration_behavior === 'none' && !rp.invoice, rp.explanation[1]);
     const invCount = (await invoices(t.id)).length;
     const again = (await buyX(t)).state.xAddon;
-    check('FrozenRemaining restored: 266 / 50, no invoice', again.status === 'ACTIVE' && again.ledger?.granted === 266 && again.ledger?.used === 50 && (await invoices(t.id)).length === invCount,
+    check('FrozenRemaining restored: 387 / 50, no invoice', again.status === 'ACTIVE' && again.ledger?.granted === 387 && again.ledger?.used === 50 && (await invoices(t.id)).length === invCount,
       `${again.ledger?.granted} / ${again.ledger?.used}`);
+    const mItem = await xOnStripe(t.id);
+    check('…on the same item, quantity 0 → 1', mItem.length === 1 && mItem[0].id === cancelledM.parkedItem?.id && mItem[0].quantity === 1);
     const renewed = (await advance(t.id, at(2026, 9, 5, 1))).state;
     const inv = (await invoices(t.id))[0];
     check('On 05/09 the X item renews and is charged normally', inv.status === 'paid' && inv.lines.some((l) => /X Social/.test(l.description ?? '') && l.amount > 0),
       `${inv.number} ${money(inv.total)}`);
-    check('September rises to 2,000 with Used kept at 50', renewed.xAddon.ledger?.granted === 2000 && renewed.xAddon.ledger?.used === 50,
-      `${renewed.xAddon.ledger?.granted} / ${renewed.xAddon.ledger?.used}`);
+    check('The renewal opens the next quota month 05/09 → 05/10 at 2,000, Used 0', renewed.xAddon.ledger?.granted === 2000 && renewed.xAddon.ledger?.used === 0 &&
+      renewed.xAddon.quotaMonth.start === at(2026, 9, 5), `${renewed.xAddon.ledger?.granted} / ${renewed.xAddon.ledger?.used} · ${day(renewed.xAddon.quotaMonth.start)}`);
+    t.done = true;
+  });
+
+  await scenario('N', 'The quantity-0 item: kept to AlreadyPaidUntil, cleaned up with no proration, retried for 24 hours, reused while it lasts', async () => {
+    const t = await tenant('n', at(2026, 9, 20));
+    const itemId = (await buyX(t)).state.xAddon.itemId;
+    await advance(t.id, at(2026, 9, 25));
+    await POST(`/x-addon/${t.id}/cancel`);
+    let items = await xOnStripe(t.id);
+    check('Cancel on 25/09: same item at quantity 0, kept until AlreadyPaidUntil 20/10', items.length === 1 && items[0].id === itemId && items[0].quantity === 0 &&
+      (await state(t.id)).xAddon.parkedItem?.alreadyPaidUntil === at(2026, 10, 20));
+
+    await PUT('/policy', { constraints: { xCleanupPaused: true } });
+    const failing = (await advance(t.id, at(2026, 10, 20, 1))).state.xAddon;
+    items = await xOnStripe(t.id);
+    check('A cleanup that fails at the boundary leaves the item at 0 and is retried', items.length === 1 && items[0].quantity === 0 && Boolean(failing.parkedItem?.cleanupError),
+      failing.parkedItem?.cleanupError ?? '');
+    const overdue = (await advance(t.id, at(2026, 10, 21, 2))).state.xAddon;
+    const events = await GET(`/events?accountId=${t.id}&limit=200`);
+    check('Still failing 24 hours after the boundary: an operational alert', events.some((e) => e.action === 'x.cleanup_overdue') && overdue.warnings.some((w) => /24 hours/.test(w)));
+
+    const rp = await previewBuyX(t);
+    check('Buying X again past AlreadyPaidUntil, item still there: reuse it, prorated normally from now (row 59)',
+      rp.stripeParams.items[0].id === itemId && rp.stripeParams.proration_date === at(2026, 10, 21, 2) && rp.stripeParams.proration_behavior === 'always_invoice' && rp.explanation[0].includes('new activation'),
+      `${rp.stripeParams.items[0].id ?? 'new item'} · ${day(rp.stripeParams.proration_date)}`);
+    const again = (await buyX(t)).state.xAddon;
+    items = await xOnStripe(t.id);
+    const inv = (await invoices(t.id))[0];
+    const charge = Math.round((2000 * (at(2026, 11, 20) - at(2026, 10, 21, 2))) / (at(2026, 11, 20) - at(2026, 10, 20)));
+    check('Same item 0 → 1, charged 21/10 02:00 → 20/11', items.length === 1 && items[0].id === itemId && items[0].quantity === 1 && near(inv.total, charge, 2),
+      `${money(inv.total)} ≈ ${money(charge)}`);
+    const month = Math.floor((2000 * (at(2026, 11, 20) - at(2026, 10, 21, 2))) / (at(2026, 11, 20) - at(2026, 10, 20)));
+    check(`The quota month 20/10 → 20/11 granted by that coverage only: ${month}`, again.status === 'ACTIVE' && again.ledger?.granted === month, `${again.ledger?.granted}`);
+
+    await POST('/policy/presets/scio_portal_mvp');
+    await advance(t.id, at(2026, 10, 25));
+    const c2 = (await POST(`/x-addon/${t.id}/cancel`)).state.xAddon;
+    check('Cancel on 25/10, xPaidThrough 20/11 = quotaMonthEnd 20/11: no credit, kept until 20/11', c2.parkedItem?.alreadyPaidUntil === at(2026, 11, 20),
+      day(c2.parkedItem?.alreadyPaidUntil));
+    const boundary = (await advance(t.id, at(2026, 11, 20, 1))).state.xAddon;
+    const renewal = (await invoices(t.id))[0];
+    check('At AlreadyPaidUntil 20/11 the item is deleted with no proration', (await xOnStripe(t.id)).length === 0 && Boolean(boundary.cleanedUpAt));
+    check('The renewal at that boundary charges nothing for X', xAmount(renewal) === 0,
+      `${renewal.number} ${money(renewal.total)}${hasXLine(renewal) ? ' — carries a $0 X line: Stripe renewed before the cleanup could run' : ' — no X line'}`);
+    await advance(t.id, at(2026, 12, 20, 1));
+    const next = (await invoices(t.id))[0];
+    check('The next renewal after the cleanup has no X line at all', !hasXLine(next) && next.status === 'paid', `${next.number} ${money(next.total)}`);
+    t.done = true;
+  });
+
+  await scenario('P', 'Row 59 on the 20th: billing 20/09 → 20/10 IS the quota month, Cancel 25/09 credits nothing, Buy X again 27/09 costs nothing', async () => {
+    const t = await tenant('p', at(2026, 9, 20));
+    const itemId = (await buyX(t)).state.xAddon.itemId;
+    await sync(t.id, { kind: 'auto', returned: 40, actionId: 'p-1' });
+    await advance(t.id, at(2026, 9, 25));
+    const before = await balance(t.id);
+    await POST(`/x-addon/${t.id}/cancel`);
+    check('Cancel credits nothing — the whole paid month funded the grant — and keeps the item at quantity 0',
+      (await balance(t.id)) === before && (await xOnStripe(t.id))[0]?.quantity === 0, money(before - (await balance(t.id))));
+    await advance(t.id, at(2026, 9, 27));
+    const invCount = (await invoices(t.id)).length;
+    const rp = await previewBuyX(t);
+    check('Buy X again 27/09: same item 0 → 1, already paid until 20/10 → proration none',
+      rp.stripeParams.items[0].id === itemId && rp.stripeParams.proration_behavior === 'none' && !rp.invoice,
+      `${rp.stripeParams.items[0].id} · ${rp.stripeParams.proration_behavior}`);
+    const again = (await buyX(t)).state.xAddon;
+    check('No invoice for buying it again', (await invoices(t.id)).length === invCount);
+    check('FrozenRemaining in use again until 20/10: 2,000 / 40', again.status === 'ACTIVE' && again.ledger?.granted === 2000 && again.ledger?.used === 40,
+      `${again.ledger?.granted} / ${again.ledger?.used}`);
+    const items = await xOnStripe(t.id);
+    check('One X item, the same one, at quantity 1', items.length === 1 && items[0].id === itemId && items[0].quantity === 1);
     t.done = true;
   });
 

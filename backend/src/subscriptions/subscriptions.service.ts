@@ -104,10 +104,20 @@ export class SubscriptionsService {
 
   // -------------------------------------------------------------- item build
 
+  /** A cancelled X add-on's item, kept at quantity 0 until AlreadyPaidUntil (MODEL V6 rows 49, 51). */
+  private parkedXItem(sub: Stripe.Subscription | null, maps: CatalogMaps): Stripe.SubscriptionItem | null {
+    return (
+      sub?.items?.data.find(
+        (i) => i.quantity === 0 && maps.byPriceId.get(typeof i.price === 'string' ? i.price : i.price?.id)?.code === X_ADDON_CODE,
+      ) ?? null
+    );
+  }
+
   private async buildItems(
     desired: DesiredState,
     sub: Stripe.Subscription | null,
     maps: CatalogMaps,
+    opts: { omitParkedX?: boolean } = {},
   ): Promise<Stripe.SubscriptionUpdateParams.Item[]> {
     const existing = sub ? readSubscriptionState(sub, maps.byPriceId) : null;
     const items: Stripe.SubscriptionUpdateParams.Item[] = [];
@@ -126,15 +136,61 @@ export class SubscriptionsService {
     for (const code of codes) {
       const quantity = desiredMap.get(code) ?? 0;
       const itemId = existingIds[code];
+      const existingQuantity = sub?.items?.data.find((i) => i.id === itemId)?.quantity;
       if (quantity > 0) {
         const priceId = await this.catalog.priceIdFor(code, desired.term);
         items.push(itemId ? { id: itemId, price: priceId, quantity } : { price: priceId, quantity });
+      } else if (itemId && code === X_ADDON_CODE && existingQuantity === 0 && opts.omitParkedX) {
+        // already moved to the new price on its own, with no proration — see moveParkedX()
+        continue;
+      } else if (itemId && code === X_ADDON_CODE && existingQuantity === 0) {
+        /*
+         * MODEL V6 rows 60, 64, CASE 9: a cancelled X add-on keeps its item at
+         * quantity 0 until AlreadyPaidUntil. It follows the new interval's price
+         * but stays at 0 — stated explicitly, because a price change otherwise
+         * resets quantity — so it is neither charged, credited nor switched back
+         * on. Deleting it here would take away what buying X again reuses.
+         */
+        const priceId = await this.catalog.priceIdFor(code, desired.term);
+        items.push({ id: itemId, price: priceId, quantity: 0 });
       } else if (itemId) {
         items.push({ id: itemId, deleted: true });
       }
     }
 
     return items;
+  }
+
+  /**
+   * MODEL V6 rows 60, 64, CASE 9: while FROZEN, an interval change moves the
+   * quantity-0 X item to the new price with no proration, and X is neither
+   * charged nor credited.
+   *
+   * It has to be its own request. Measured on Stripe test mode: after a Cancel
+   * set the item 1 → 0 with a future proration_date (quotaMonthEnd), Stripe
+   * still counts it at quantity 1 up to that date, so any change that restarts
+   * the billing period — even one that leaves the X item out — credits X for
+   * now → quotaMonthEnd, a stretch that funded this quota month. Moving the X
+   * item first with proration_behavior=none clears that, and the base plan's
+   * change that follows carries no X line at all.
+   */
+  private async moveParkedX(account: AccountDocument, sub: Stripe.Subscription, maps: CatalogMaps, term: BillingTerm) {
+    const parked = this.parkedXItem(sub, maps);
+    if (!parked) return null;
+    const price = await this.catalog.priceIdFor(X_ADDON_CODE, term);
+    const before = typeof parked.price === 'string' ? parked.price : parked.price.id;
+    if (before === price) return null;
+    const params: Stripe.SubscriptionUpdateParams = { items: [{ id: parked.id, price, quantity: 0 }], proration_behavior: 'none' };
+    await this.stripe.call('subscriptions.update (frozen X: new interval price, quantity 0, no proration)', () =>
+      this.stripe.client.subscriptions.update(sub.id, params),
+    );
+    await this.events.record({
+      accountId: account.id,
+      action: 'x.frozen_interval_moved',
+      summary: `Frozen X item ${parked.id} moved to the ${term} price at quantity 0 with proration_behavior=none — X is neither charged nor credited (MODEL V6 rows 60, 64).`,
+      stripeRequest: params as any,
+    });
+    return { itemId: parked.id, previousPrice: before };
   }
 
   // ------------------------------------------------------------------- X
@@ -419,7 +475,9 @@ export class SubscriptionsService {
       };
     }
 
-    const items = await this.buildItems(desired, sub, maps);
+    const parkedX = this.parkedXItem(sub, maps);
+    const moveParkedX = Boolean(sub && parkedX && current.term !== desired.term);
+    const items = await this.buildItems(desired, sub, maps, { omitParkedX: moveParkedX });
     const prorationDate = await this.stripe.nowFor(account.testClockId);
 
     // A scheduled change does not touch the current invoice at all.
@@ -558,7 +616,29 @@ export class SubscriptionsService {
     if (sub && current.term !== desired.term && desired.addOns.some((a) => a.code === X_ADDON_CODE)) {
       explanation.push(
         'The X add-on follows the base interval (MODEL V6 rows 60, 64): Stripe prorates it natively with the base plan. SCIO keeps the quota month and Used as they are and only adds a positive delta if the paid coverage grows — the same stretch of time is never granted twice.',
+        'The quota cycle does not move with it: it keeps the anchor X was bought on, while billing restarts on the new interval. From this change on, quota months and billing periods run on separate cycles.',
       );
+    }
+    let summary = invoice ? this.stripe.summarizeInvoice(invoice) : null;
+    if (moveParkedX && parkedX) {
+      explanation.push(
+        `The X add-on is cancelled (FROZEN): its item ${parkedX.id} moves to the ${desired.term} price but stays at quantity 0 (MODEL V6 rows 60, 64, CASE 9) — not charged, not credited and not switched back on. Buying X again is the only way back.`,
+        'That move is its own request, sent first with proration_behavior=none; the base plan change follows and carries no X line. Stripe cannot preview the two together, so any X line it prices here is left out of the invoice below.',
+      );
+      if (summary) {
+        const xPrices = [...maps.byPriceId.entries()].filter(([, v]) => v.code === X_ADDON_CODE).map(([id]) => id);
+        const dropped = summary.lines.filter((l) => l.priceId && xPrices.includes(l.priceId));
+        const cut = dropped.reduce((s, l) => s + l.amount, 0);
+        summary = {
+          ...summary,
+          lines: summary.lines.filter((l) => !dropped.includes(l)),
+          subtotal: summary.subtotal - cut,
+          total: summary.total - cut,
+          amountDue: Math.max(0, summary.amountDue - cut),
+          prorationTotal: summary.prorationTotal - dropped.filter((l) => l.proration).reduce((s, l) => s + l.amount, 0),
+          recurringTotal: summary.recurringTotal - dropped.filter((l) => !l.proration).reduce((s, l) => s + l.amount, 0),
+        };
+      }
     }
 
     return {
@@ -570,7 +650,7 @@ export class SubscriptionsService {
       mode: sub ? 'update' : 'create',
       trial: trial ? { willApply: trial.apply, reason: trial.reason, days: policy.trial.days, error: trial.error ?? null } : null,
       explanation,
-      invoice: invoice ? this.stripe.summarizeInvoice(invoice) : null,
+      invoice: summary,
       previewUnavailable,
       stripeParams: previewParams,
     };
@@ -815,8 +895,12 @@ export class SubscriptionsService {
       }
     }
 
+    // MODEL V6 rows 60, 64: a frozen X item moves first, on its own, with no proration
+    const moved = readSubscriptionState(sub, maps.byPriceId).term !== desired.term
+      ? await this.moveParkedX(account, sub, maps, desired.term)
+      : null;
     const balanceBefore = await this.customerBalance(account);
-    const items = await this.buildItems(desired, sub, maps);
+    const items = await this.buildItems(desired, sub, maps, { omitParkedX: Boolean(moved) });
     const prorationDate = await this.stripe.nowFor(account.testClockId);
 
     /*
@@ -864,9 +948,20 @@ export class SubscriptionsService {
       params.proration_date = prorationDate;
     }
 
-    const updated = await this.stripe.call('subscriptions.update', () =>
-      this.stripe.client.subscriptions.update(sub.id, params),
-    );
+    let updated: Stripe.Subscription;
+    try {
+      updated = await this.stripe.call('subscriptions.update', () =>
+        this.stripe.client.subscriptions.update(sub.id, params),
+      );
+    } catch (err) {
+      // put the frozen X item back on the old price, so a refused change leaves nothing half-done
+      if (moved) {
+        await this.stripe.client.subscriptions
+          .update(sub.id, { items: [{ id: moved.itemId, price: moved.previousPrice, quantity: 0 }], proration_behavior: 'none' })
+          .catch((e) => this.logger.error(`Could not move frozen X item ${moved.itemId} back: ${e.message}`));
+      }
+      throw err;
+    }
 
     const balanceAfter = await this.customerBalance(account);
     // Stripe balances are negative when the customer is in credit.

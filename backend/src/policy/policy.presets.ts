@@ -307,7 +307,7 @@ export const PRESETS: PresetDef[] = [
     key: 'scio_portal_mvp',
     name: 'SCIO Portal (MVP)',
     description:
-      'The migration subset: Standard plan plus the one X Social add-on ($20/mo or $216/yr, quantity 1). Money is prorated natively by Stripe; quota is SCIO\'s, granted by paid time on a fixed calendar quota month. Cancelling X freezes it at once (monthly: no refund; yearly: credit from quotaMonthEnd). Dropping the base plan to Free lands at the end of the paid base period.',
+      'The migration subset: Standard plan plus the one X Social add-on ($20/mo or $216/yr, quantity 1). Money is prorated natively by Stripe; quota is SCIO\'s, granted by paid time on a quota month that starts on the billing anchor of the base plan and keeps it. Cancelling X freezes it at once and parks its item at quantity 0; only paid time after quotaMonthEnd is credited. Dropping the base plan to Free lands at the end of the paid base period.',
     policy: SCIO_PORTAL_MVP,
   },
   {

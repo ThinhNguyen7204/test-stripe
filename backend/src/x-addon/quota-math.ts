@@ -5,9 +5,12 @@
  *
  *  - Stripe owns money and billing time. What it has been PAID for is a set of
  *    time ranges: the periods on the X lines of paid invoices.
- *  - SCIO owns the quota month, fixed to the calendar in UTC
- *    ([1st 00:00, 1st of next month 00:00)), whatever day Stripe bills on
- *    (row 46).
+ *  - SCIO owns the quota month: whole months stepped from a per-tenant quota
+ *    ANCHOR. The anchor is the base plan's billing cycle anchor at the moment X
+ *    is first bought, so to begin with a quota month IS the base plan's billing
+ *    month. It is never moved afterwards — in particular not by a base-plan
+ *    interval change, which restarts Stripe's billing cycle but leaves the
+ *    quota cycle where it was. From that change on the two cycles run apart.
  *
  * A quota month's target is the share of it that is paid for:
  * `floor(2,000 × paidCoveredSeconds / monthSeconds)` (rows 5 and 47). Paid
@@ -40,16 +43,36 @@ export interface Interval {
   end: number;
 }
 
-/** The SCIO quota month that contains `t` (row 46). */
-export function quotaMonthOf(t: number): Interval {
-  const d = new Date(t * 1000);
-  const start = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / 1000;
-  const end = Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / 1000;
-  return { start, end };
+/**
+ * `anchor` moved by `k` whole months, keeping its time of day and clamping its
+ * day to the month's length. Always computed from the anchor itself, never from
+ * the previous step, so a 31st anchor goes 31 Jan → 28 Feb → 31 Mar — the same
+ * rule Stripe applies to a monthly billing_cycle_anchor, which is what keeps a
+ * quota month aligned with the billing month it started from.
+ */
+export function addMonthsClamped(anchor: number, k: number): number {
+  const a = new Date(anchor * 1000);
+  const year = a.getUTCFullYear();
+  const month = a.getUTCMonth() + k;
+  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  return (
+    Date.UTC(year, month, Math.min(a.getUTCDate(), lastDay), a.getUTCHours(), a.getUTCMinutes(), a.getUTCSeconds()) /
+    1000
+  );
 }
 
-export function nextQuotaMonth(q: Interval): Interval {
-  return quotaMonthOf(q.end);
+/** The SCIO quota month that contains `t`, on the cycle stepped from `anchor`. */
+export function quotaMonthOf(t: number, anchor: number): Interval {
+  const a = new Date(anchor * 1000);
+  const d = new Date(t * 1000);
+  let k = (d.getUTCFullYear() - a.getUTCFullYear()) * 12 + (d.getUTCMonth() - a.getUTCMonth());
+  while (addMonthsClamped(anchor, k) > t) k -= 1;
+  while (addMonthsClamped(anchor, k + 1) <= t) k += 1;
+  return { start: addMonthsClamped(anchor, k), end: addMonthsClamped(anchor, k + 1) };
+}
+
+export function nextQuotaMonth(q: Interval, anchor: number): Interval {
+  return quotaMonthOf(q.end, anchor);
 }
 
 /** Sorted, merged, empty ranges dropped. */
@@ -165,12 +188,12 @@ export function proportionalTarget(coverage: Interval[], q: Interval): number {
 }
 
 /** Every quota month a range touches, in order. */
-export function quotaMonthsTouching(range: Interval): Interval[] {
+export function quotaMonthsTouching(range: Interval, anchor: number): Interval[] {
   const months: Interval[] = [];
-  let q = quotaMonthOf(range.start);
+  let q = quotaMonthOf(range.start, anchor);
   while (q.start < range.end) {
     months.push(q);
-    q = nextQuotaMonth(q);
+    q = nextQuotaMonth(q, anchor);
   }
   return months;
 }
@@ -183,7 +206,7 @@ export function quotaMonthsTouching(range: Interval): Interval[] {
  * to a year that is still paid in full — a year cut short by a cancellation is
  * not owed 24,000.
  */
-export function annualTrueUp(coverage: Interval[], lines: XInvoiceLine[], q: Interval): number {
+export function annualTrueUp(coverage: Interval[], lines: XInvoiceLine[], q: Interval, anchor: number): number {
   let trueUp = 0;
   for (const line of lines) {
     if (!line.yearly || line.amount < 0) continue;
@@ -191,7 +214,7 @@ export function annualTrueUp(coverage: Interval[], lines: XInvoiceLine[], q: Int
     if (year.end - year.start < FULL_YEAR_SECONDS) continue;
     if (!(year.end > q.start && year.end <= q.end)) continue;
     if (!contains(coverage, year)) continue;
-    const floored = quotaMonthsTouching(year).reduce((sum, m) => sum + proportionalTarget([year], m), 0);
+    const floored = quotaMonthsTouching(year, anchor).reduce((sum, m) => sum + proportionalTarget([year], m), 0);
     trueUp += Math.max(0, X_ANNUAL_TOTAL - floored);
   }
   return trueUp;
@@ -202,8 +225,8 @@ export function annualTrueUp(coverage: Interval[], lines: XInvoiceLine[], q: Int
  * annual true-up when a paid year ends inside it, never above a whole month's
  * 2,000.
  */
-export function grantedTarget(coverage: Interval[], lines: XInvoiceLine[], q: Interval): number {
-  return Math.min(X_MONTHLY_TARGET, proportionalTarget(coverage, q) + annualTrueUp(coverage, lines, q));
+export function grantedTarget(coverage: Interval[], lines: XInvoiceLine[], q: Interval, anchor: number): number {
+  return Math.min(X_MONTHLY_TARGET, proportionalTarget(coverage, q) + annualTrueUp(coverage, lines, q, anchor));
 }
 
 /** What an extra paid range would add to a quota month, for previews. */
@@ -213,8 +236,9 @@ export function projectedDelta(
   q: Interval,
   added: Interval | null,
   alreadyGranted: number,
+  anchor: number,
 ): { target: number; delta: number } {
   const next = added ? union([...coverage, added]) : coverage;
-  const target = Math.max(alreadyGranted, grantedTarget(next, lines, q));
+  const target = Math.max(alreadyGranted, grantedTarget(next, lines, q, anchor));
   return { target, delta: target - alreadyGranted };
 }

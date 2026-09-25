@@ -68,3 +68,25 @@ export class XCapacityReservation {
 }
 
 export const XCapacityReservationSchema = SchemaFactory.createForClass(XCapacityReservation);
+
+export type XTenantLockDocument = HydratedDocument<XTenantLock>;
+
+/**
+ * MODEL V6 row 8: buying X again and the boundary cleanup of a quantity-0 item
+ * both touch the same Stripe item, so they take this lock first. One row per
+ * tenant; a holder that dies leaves it to expire after `expiresAt`.
+ */
+@Schema({ timestamps: true, collection: 'x_tenant_locks' })
+export class XTenantLock {
+  @Prop({ required: true, unique: true })
+  accountId!: string;
+
+  @Prop({ required: true })
+  holder!: string;
+
+  /** wall-clock unix seconds */
+  @Prop({ required: true })
+  expiresAt!: number;
+}
+
+export const XTenantLockSchema = SchemaFactory.createForClass(XTenantLock);
